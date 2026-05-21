@@ -75,7 +75,7 @@ const GEMINI_35_FLASH_HIGH_MODEL = "gemini-3-flash-agent";
  * Dotted-minor Gemini generations (gemini-3.1, gemini-3.5, ...) use BARE model
  * names on the Gemini CLI backend, unlike the legacy 3.0 line (gemini-3-pro) which
  * uses a "-preview" suffix. Confirmed against the antigravity (`agy`) and `gemini`
- * CLIs, which ship `gemini-3.1-pro`/`gemini-3.1-flash` (no `-preview`).
+ * CLIs, which ship `gemini-3.1-pro` (no `-preview`).
  */
 const GEMINI_DOTTED_MINOR_REGEX = /^gemini-3\.(?:[1-9]\d*)/i;
 
