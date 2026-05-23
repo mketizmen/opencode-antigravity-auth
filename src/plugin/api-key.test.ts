@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   getAgySdkCredentials,
@@ -7,6 +7,7 @@ import {
   prepareAgySdkGeminiRequest,
   selectAgySdkCredential,
   markAgySdkCredentialRateLimited,
+  resetAgySdkCredentialStateForTests,
 } from "./api-key";
 import { DEFAULT_CONFIG, type AntigravityConfig } from "./config";
 
@@ -22,6 +23,10 @@ function withConfig(overrides: Partial<AntigravityConfig>): AntigravityConfig {
 }
 
 describe("api-key agy sdk support", () => {
+  beforeEach(() => {
+    resetAgySdkCredentialStateForTests();
+  });
+
   it("loads API key credentials from auth, config cloud projects, and environment", () => {
     vi.stubEnv("GEMINI_API_KEY", "env-key");
     try {
@@ -91,6 +96,33 @@ describe("api-key agy sdk support", () => {
       },
       tools: [{ googleSearch: {} }],
     });
+  });
+
+  it("preserves Request input method, headers, and body when routing through API-key auth", () => {
+    const original = new Request(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?key=old-url-key",
+      {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer oauth",
+          "x-request-id": "request-123",
+        },
+        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+      },
+    );
+
+    const prepared = prepareAgySdkGeminiRequest(
+      original,
+      undefined,
+      { label: "backup", apiKey: "test-key", projectId: "cloud-project" },
+    );
+
+    const headers = new Headers(prepared.init.headers);
+    expect(prepared.init.method).toBe("POST");
+    expect(prepared.init.body).toBe(original.body);
+    expect(headers.get("x-request-id")).toBe("request-123");
+    expect(headers.get("Authorization")).toBeNull();
+    expect(headers.get("x-goog-api-key")).toBe("test-key");
   });
 
   it("adds default Gemini 3 thinking config without dropping extra body options", () => {
@@ -179,6 +211,17 @@ describe("api-key agy sdk support", () => {
     expect(selectAgySdkCredential([first, second])).toEqual(second);
   });
 
+  it("resets API-key credential rotation and rate-limit state for isolated tests", () => {
+    const first = { label: "first", apiKey: "first" };
+    const second = { label: "second", apiKey: "second" };
+
+    markAgySdkCredentialRateLimited(first, 60_000);
+    expect(selectAgySdkCredential([first, second])).toEqual(second);
+
+    resetAgySdkCredentialStateForTests();
+    expect(selectAgySdkCredential([first, second])).toEqual(first);
+  });
+
   it("fetches Gemini API models with API-key header and pagination", async () => {
     const requests: RequestInfo[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo, _init?: RequestInit) => {
@@ -206,8 +249,43 @@ describe("api-key agy sdk support", () => {
       expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
         headers: { "x-goog-api-key": "secret" },
       });
+      expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
       expect(String(requests[0])).toContain("pageSize=1000");
       expect(String(requests[1])).toContain("pageToken=next");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("stops Gemini API model pagination when the service repeats a page token", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      models: [],
+      nextPageToken: "repeat",
+    }))));
+
+    try {
+      await expect(fetchGeminiApiModels({ label: "test", apiKey: "secret" })).rejects.toThrow(
+        "repeated page token",
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("stops Gemini API model pagination after the maximum page count", async () => {
+    let page = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      page += 1;
+      return new Response(JSON.stringify({
+        models: [],
+        nextPageToken: `next-${page}`,
+      }));
+    }));
+
+    try {
+      await expect(fetchGeminiApiModels({ label: "test", apiKey: "secret" })).rejects.toThrow(
+        "exceeded 20 pages",
+      );
     } finally {
       vi.unstubAllGlobals();
     }

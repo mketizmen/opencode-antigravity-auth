@@ -19,6 +19,14 @@ export interface GeminiApiModelsResponse {
 const rateLimitedUntilByKey = new Map<string, number>();
 let cursor = 0;
 
+const GEMINI_MODELS_LIST_TIMEOUT_MS = 10000;
+const GEMINI_MODELS_LIST_MAX_PAGES = 20;
+
+export function resetAgySdkCredentialStateForTests(): void {
+  rateLimitedUntilByKey.clear();
+  cursor = 0;
+}
+
 function splitEnvList(value: string | undefined): string[] {
   if (!value) return [];
   return value
@@ -227,7 +235,8 @@ export function prepareAgySdkGeminiRequest(
   init: RequestInit | undefined,
   credential: AgySdkCredential,
 ): { request: RequestInfo; init: RequestInit; model?: string } {
-  const urlString = typeof input === "string" ? input : (input as Request).url;
+  const requestInput = typeof input === "string" ? undefined : input;
+  const urlString = requestInput?.url ?? input.toString();
   const url = new URL(urlString);
   const match = url.pathname.match(/\/models\/([^:]+):(\w+)/);
   const rawModel = match?.[1] ?? undefined;
@@ -239,32 +248,49 @@ export function prepareAgySdkGeminiRequest(
   }
   url.searchParams.delete("key");
 
-  const headers = new Headers(init?.headers ?? {});
+  const headers = new Headers(init?.headers ?? requestInput?.headers ?? {});
   headers.delete("Authorization");
   headers.delete("x-api-key");
   headers.set("x-goog-api-key", credential.apiKey);
   headers.delete("x-goog-user-project");
 
-  let body = init?.body;
+  const originalBody = init?.body ?? requestInput?.body ?? undefined;
+  let body = originalBody;
   if (typeof body === "string" && body.trim()) {
     try {
       const payload = JSON.parse(body) as RequestPayload;
       applyAgySdkGeminiBodyTransforms(payload, resolved?.actualModel ?? rawModel ?? "", resolved?.thinkingLevel);
       body = JSON.stringify(payload);
     } catch {
-      body = init?.body;
+      body = originalBody;
     }
   }
 
   return {
     request: url.toString(),
     init: {
+      method: requestInput?.method,
       ...init,
       headers,
       body,
     },
     model: resolved?.actualModel ?? rawModel,
   };
+}
+
+async function fetchGeminiModelsPage(url: string, credential: AgySdkCredential): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEMINI_MODELS_LIST_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "x-goog-api-key": credential.apiKey,
+      },
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function fetchWithAgySdkCredential(
@@ -284,19 +310,20 @@ export async function fetchWithAgySdkCredential(
 export async function fetchGeminiApiModels(credential: AgySdkCredential): Promise<GeminiApiModel[]> {
   const models: GeminiApiModel[] = [];
   let pageToken: string | undefined;
+  const seenPageTokens = new Set<string>();
 
-  do {
+  for (let page = 0; page < GEMINI_MODELS_LIST_MAX_PAGES; page += 1) {
     const url = new URL("https://generativelanguage.googleapis.com/v1beta/models");
     url.searchParams.set("pageSize", "1000");
     if (pageToken) {
+      if (seenPageTokens.has(pageToken)) {
+        throw new Error(`Gemini models.list returned repeated page token for ${credential.label}`);
+      }
+      seenPageTokens.add(pageToken);
       url.searchParams.set("pageToken", pageToken);
     }
 
-    const response = await fetch(url.toString(), {
-      headers: {
-        "x-goog-api-key": credential.apiKey,
-      },
-    });
+    const response = await fetchGeminiModelsPage(url.toString(), credential);
     if (!response.ok) {
       const body = await response.text().catch(() => "");
       const snippet = body.trim().slice(0, 200);
@@ -306,7 +333,8 @@ export async function fetchGeminiApiModels(credential: AgySdkCredential): Promis
     const payload = (await response.json()) as GeminiApiModelsResponse;
     models.push(...(payload.models ?? []));
     pageToken = payload.nextPageToken;
-  } while (pageToken);
+    if (!pageToken) return models;
+  }
 
-  return models;
+  throw new Error(`Gemini models.list exceeded ${GEMINI_MODELS_LIST_MAX_PAGES} pages for ${credential.label}`);
 }
