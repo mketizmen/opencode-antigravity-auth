@@ -54,10 +54,13 @@ import { initHealthTracker, getHealthTracker, initTokenTracker, getTokenTracker 
 import { initAntigravityVersion } from "./plugin/version";
 import { executeSearch } from "./plugin/search";
 import {
+  createAntigravityOnlyModelErrorResponse,
+  extractRequestedGeminiModel,
   fetchWithAgySdkCredential,
   fetchGeminiApiModels,
   getAgySdkCredentials,
   isAgySdkSupportedRequest,
+  isAntigravityOnlyGenerativeLanguageRequest,
   isApiKeyAuth,
   selectAgySdkCredential,
 } from "./plugin/api-key";
@@ -1686,6 +1689,16 @@ export const createAntigravityPlugin = (providerId: string) => async (
           apiKey: "",
           async fetch(input, init) {
             const urlString = toUrlString(input);
+            // Antigravity-only models (e.g. gemini-3.1-pro) can't be served by
+            // the public Gemini API. Without OAuth there's no quota path that
+            // can satisfy them, so short-circuit with actionable guidance
+            // instead of forwarding to a guaranteed 404.
+            if (isAntigravityOnlyGenerativeLanguageRequest(urlString)) {
+              const requestedModel = extractRequestedGeminiModel(urlString);
+              if (requestedModel) {
+                return createAntigravityOnlyModelErrorResponse(requestedModel);
+              }
+            }
             if (!isAgySdkSupportedRequest(urlString)) {
               return fetch(input, init);
             }
@@ -1760,6 +1773,15 @@ export const createAntigravityPlugin = (providerId: string) => async (
           if (!isOAuthAuth(latestAuth)) {
             const latestCredentials = getAgySdkCredentials(config, isApiKeyAuth(latestAuth) ? latestAuth : null);
             const urlString = toUrlString(input);
+            // Antigravity-only models can't be served by the public Gemini API
+            // and there's no OAuth quota path available here — short-circuit
+            // with actionable guidance instead of forwarding to a 404.
+            if (isAntigravityOnlyGenerativeLanguageRequest(urlString)) {
+              const requestedModel = extractRequestedGeminiModel(urlString);
+              if (requestedModel) {
+                return createAntigravityOnlyModelErrorResponse(requestedModel);
+              }
+            }
             if (isAgySdkSupportedRequest(urlString)) {
               const response = await tryFetchWithAgySdkCredentials(
                 input,

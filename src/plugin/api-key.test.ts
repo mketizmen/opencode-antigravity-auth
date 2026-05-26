@@ -1,10 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  createAntigravityOnlyModelErrorResponse,
   enhanceAgySdkErrorResponse,
+  extractRequestedGeminiModel,
   getAgySdkCredentials,
   fetchGeminiApiModels,
   isAgySdkSupportedRequest,
+  isAntigravityOnlyGenerativeLanguageRequest,
   isLikelyAntigravityOnlyModel,
   prepareAgySdkGeminiRequest,
   selectAgySdkCredential,
@@ -217,16 +220,53 @@ describe("api-key agy sdk support", () => {
     );
   });
 
-  it("skips Claude requests and rate-limited keys", () => {
-    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent")).toBe(true);
+  it("skips Claude requests, Antigravity-only Gemini ids, and rate-limited keys", () => {
+    // Public-API Gemini ids are routable to the API-key path.
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent")).toBe(true);
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent")).toBe(true);
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent")).toBe(true);
+
+    // Antigravity-only bare Gemini ids and Claude/antigravity-prefixed ids are NOT routable
+    // to the API-key path — the public Gemini API doesn't serve them.
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent")).toBe(false);
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:generateContent")).toBe(false);
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent")).toBe(false);
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash:generateContent")).toBe(false);
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/antigravity-gemini-3.1-pro:generateContent")).toBe(false);
     expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/claude-opus-4-6-thinking:generateContent")).toBe(false);
+
+    // Non-model URLs and untrusted hosts are not routable.
     expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models")).toBe(false);
-    expect(isAgySdkSupportedRequest("https://example.com/redirect?next=https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent")).toBe(false);
+    expect(isAgySdkSupportedRequest("https://example.com/redirect?next=https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent")).toBe(false);
 
     const first = { label: "first", apiKey: "first" };
     const second = { label: "second", apiKey: "second" };
     markAgySdkCredentialRateLimited(first, 60_000);
     expect(selectAgySdkCredential([first, second])).toEqual(second);
+  });
+
+  it("isAntigravityOnlyGenerativeLanguageRequest identifies Antigravity-only Gemini requests", () => {
+    // Antigravity-only bare ids on the generativelanguage host → true
+    expect(isAntigravityOnlyGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:generateContent")).toBe(true);
+    expect(isAntigravityOnlyGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:streamGenerateContent")).toBe(true);
+    expect(isAntigravityOnlyGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash:generateContent")).toBe(true);
+
+    // Public-API Gemini ids → false (they CAN be served by the public API)
+    expect(isAntigravityOnlyGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent")).toBe(false);
+    expect(isAntigravityOnlyGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent")).toBe(false);
+    expect(isAntigravityOnlyGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent")).toBe(false);
+
+    // Wrong host or malformed → false
+    expect(isAntigravityOnlyGenerativeLanguageRequest("https://example.com/v1beta/models/gemini-3.1-pro:generateContent")).toBe(false);
+    expect(isAntigravityOnlyGenerativeLanguageRequest("not a url")).toBe(false);
+    expect(isAntigravityOnlyGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1beta/models")).toBe(false);
+  });
+
+  it("extractRequestedGeminiModel pulls the model id from a generativelanguage URL", () => {
+    expect(extractRequestedGeminiModel("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:generateContent")).toBe("gemini-3.1-pro");
+    expect(extractRequestedGeminiModel("https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:streamGenerateContent?alt=sse")).toBe("gemini-3-pro-preview");
+    expect(extractRequestedGeminiModel("https://generativelanguage.googleapis.com/v1beta/models")).toBeUndefined();
+    expect(extractRequestedGeminiModel("not a url")).toBeUndefined();
   });
 
   it("resets API-key credential rotation and rate-limit state for isolated tests", () => {
@@ -470,5 +510,51 @@ describe("enhanceAgySdkErrorResponse", () => {
     expect(result.headers.get("content-type")).toBe("application/json");
     expect(result.headers.get("content-length")).toBeNull();
     expect(result.headers.get("x-trace-id")).toBe("abc");
+  });
+});
+
+describe("createAntigravityOnlyModelErrorResponse", () => {
+  async function bodyOf(response: Response): Promise<{ error?: { message?: string; code?: number; status?: string } }> {
+    return JSON.parse(await response.text());
+  }
+
+  it("returns a 404 NOT_FOUND envelope shaped like the public Gemini API error", async () => {
+    const response = createAntigravityOnlyModelErrorResponse("gemini-3.1-pro");
+
+    expect(response.status).toBe(404);
+    expect(response.statusText).toBe("Not Found");
+    expect(response.headers.get("content-type")).toBe("application/json");
+
+    const body = await bodyOf(response);
+    expect(body.error?.code).toBe(404);
+    expect(body.error?.status).toBe("NOT_FOUND");
+  });
+
+  it("includes the Antigravity OAuth guidance for Antigravity-only models", async () => {
+    const response = createAntigravityOnlyModelErrorResponse("gemini-3.1-pro");
+    const body = await bodyOf(response);
+    const message = body.error?.message ?? "";
+
+    expect(message).toContain("gemini-3.1-pro");
+    expect(message).toContain("Antigravity Code Assist backend");
+    expect(message).toContain("opencode auth login");
+    expect(message).toContain("api_key_fallback");
+    expect(message).toContain("Public-API models known to work");
+  });
+
+  it("does NOT include the '(Underlying Gemini API error: ...)' line — there's no upstream cause", async () => {
+    const response = createAntigravityOnlyModelErrorResponse("gemini-3.1-pro");
+    const body = await bodyOf(response);
+    expect(body.error?.message).not.toContain("Underlying Gemini API error");
+  });
+
+  it("falls back to the spelling/lookup hint for unknown non-Antigravity models", async () => {
+    const response = createAntigravityOnlyModelErrorResponse("gemini-nonexistent-v9");
+    const body = await bodyOf(response);
+    const message = body.error?.message ?? "";
+
+    expect(message).toContain("gemini-nonexistent-v9");
+    expect(message).toContain("forwarded to the public Gemini API verbatim");
+    expect(message).not.toContain("Antigravity Code Assist");
   });
 });

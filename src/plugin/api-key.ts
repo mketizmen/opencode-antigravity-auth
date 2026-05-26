@@ -132,6 +132,15 @@ export function isApiKeyAuth(auth: unknown): auth is ApiKeyAuthDetails {
   return (candidate.type === "api" || candidate.type === "api_key") && typeof candidate.key === "string";
 }
 
+/**
+ * Returns true when the request can be safely routed through the public Gemini
+ * API (`generativelanguage.googleapis.com`) using an API key.
+ *
+ * Requests for Antigravity-only Gemini ids (see `isLikelyAntigravityOnlyModel`)
+ * are excluded: forwarding them to the public API yields a 404 NOT_FOUND because
+ * those ids are served only by the Antigravity Code Assist backend. The caller
+ * should fall back to the OAuth gemini-cli quota path instead.
+ */
 export function isAgySdkSupportedRequest(urlString: string): boolean {
   let url: URL;
   try {
@@ -141,7 +150,40 @@ export function isAgySdkSupportedRequest(urlString: string): boolean {
   }
   if (url.hostname !== "generativelanguage.googleapis.com") return false;
   const model = extractGeminiModelFromUrl(url.toString());
-  return !!model && model.toLowerCase().includes("gemini");
+  if (!model || !model.toLowerCase().includes("gemini")) return false;
+  if (isLikelyAntigravityOnlyModel(model)) return false;
+  return true;
+}
+
+/**
+ * Returns true when the URL targets `generativelanguage.googleapis.com` with a
+ * model id served only by the Antigravity Code Assist backend (e.g.
+ * `gemini-3.1-pro`, `gemini-3-pro`, `gemini-3-flash`, `gemini-3.1-flash`).
+ *
+ * Use this in API-key-only auth paths to short-circuit the request with a
+ * helpful synthetic error (via `createAntigravityOnlyModelErrorResponse`)
+ * instead of forwarding to the public Gemini API where it would 404.
+ */
+export function isAntigravityOnlyGenerativeLanguageRequest(urlString: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(urlString);
+  } catch {
+    return false;
+  }
+  if (url.hostname !== "generativelanguage.googleapis.com") return false;
+  const model = extractGeminiModelFromUrl(url.toString());
+  if (!model) return false;
+  return isLikelyAntigravityOnlyModel(model);
+}
+
+/**
+ * Extracts the requested model id from a `generativelanguage.googleapis.com`
+ * URL (e.g. `.../v1beta/models/gemini-3.1-pro:generateContent` -> `gemini-3.1-pro`).
+ * Returns `undefined` when the URL is malformed or doesn't match the model path.
+ */
+export function extractRequestedGeminiModel(urlString: string): string | undefined {
+  return extractGeminiModelFromUrl(urlString);
 }
 
 /**
@@ -196,6 +238,50 @@ interface GeminiErrorBody {
 }
 
 /**
+ * Builds the human-facing guidance message used by both
+ * `enhanceAgySdkErrorResponse` (post-hoc, after a public-API 404) and
+ * `createAntigravityOnlyModelErrorResponse` (pre-flight, before the round trip).
+ *
+ * When `originalMessage` is omitted, the trailing "(Underlying Gemini API error: ...)"
+ * line is dropped so synthetic errors don't pretend to have a real upstream cause.
+ */
+function buildAntigravityModelGuidanceMessage(
+  requestedModel: string,
+  originalMessage?: string,
+): string {
+  const suggestions = PUBLIC_GEMINI_API_MODEL_SUGGESTIONS.join(", ");
+  const antigravityOnly = isLikelyAntigravityOnlyModel(requestedModel);
+
+  const lines: string[] = [
+    `Model '${requestedModel}' was sent to the public Gemini API (v1beta) and rejected as NOT_FOUND.`,
+  ];
+  if (antigravityOnly) {
+    lines.push(
+      "",
+      "This model id is served by the Antigravity Code Assist backend, not the public Gemini API.",
+      "The plugin's API-key path forwarded the request unchanged because either:",
+      "  • opencode's 'google' provider is in API-key mode (no OAuth session), or",
+      "  • all OAuth Antigravity accounts were rate-limited and `agy_sdk.api_key_fallback` kicked in.",
+      "",
+      "To reach this model, re-authenticate with OAuth:",
+      "  opencode auth logout google",
+      "  opencode auth login   # choose Google → OAuth with Google (Antigravity)",
+    );
+  } else {
+    lines.push(
+      "",
+      "The model id was forwarded to the public Gemini API verbatim. Double-check the spelling,",
+      "or pick a model that's actually published on v1beta.",
+    );
+  }
+  lines.push("", `Public-API models known to work: ${suggestions}.`);
+  if (originalMessage) {
+    lines.push("", `(Underlying Gemini API error: ${originalMessage})`);
+  }
+  return lines.join("\n");
+}
+
+/**
  * When the public Gemini API returns 404 NOT_FOUND for a model, rewrite the
  * response body with actionable guidance. Without this, users see a bare
  * "models/X is not found for API version v1beta" from Google and have no
@@ -229,42 +315,10 @@ export async function enhanceAgySdkErrorResponse(
     originalMessage.toLowerCase().includes("model");
   if (!looksLikeModelNotFound) return response;
 
-  const suggestions = PUBLIC_GEMINI_API_MODEL_SUGGESTIONS.join(", ");
-  const antigravityOnly = isLikelyAntigravityOnlyModel(requestedModel);
-
-  const lines: string[] = [
-    `Model '${requestedModel}' was sent to the public Gemini API (v1beta) and rejected as NOT_FOUND.`,
-  ];
-  if (antigravityOnly) {
-    lines.push(
-      "",
-      "This model id is served by the Antigravity Code Assist backend, not the public Gemini API.",
-      "The plugin's API-key path forwarded the request unchanged because either:",
-      "  • opencode's 'google' provider is in API-key mode (no OAuth session), or",
-      "  • all OAuth Antigravity accounts were rate-limited and `agy_sdk.api_key_fallback` kicked in.",
-      "",
-      "To reach this model, re-authenticate with OAuth:",
-      "  opencode auth logout google",
-      "  opencode auth login   # choose Google → OAuth with Google (Antigravity)",
-    );
-  } else {
-    lines.push(
-      "",
-      "The model id was forwarded to the public Gemini API verbatim. Double-check the spelling,",
-      "or pick a model that's actually published on v1beta.",
-    );
-  }
-  lines.push(
-    "",
-    `Public-API models known to work: ${suggestions}.`,
-    "",
-    `(Underlying Gemini API error: ${originalMessage})`,
-  );
-
   const enhanced: GeminiErrorBody = {
     error: {
       code: body.error?.code ?? 404,
-      message: lines.join("\n"),
+      message: buildAntigravityModelGuidanceMessage(requestedModel, originalMessage),
       status: body.error?.status ?? "NOT_FOUND",
     },
   };
@@ -278,6 +332,31 @@ export async function enhanceAgySdkErrorResponse(
     status: response.status,
     statusText: response.statusText,
     headers,
+  });
+}
+
+/**
+ * Synthesizes the same 404 guidance produced by `enhanceAgySdkErrorResponse`,
+ * but pre-flight — before any request is sent to the public Gemini API.
+ *
+ * Use this in API-key-only auth paths when the requested model is identified by
+ * `isLikelyAntigravityOnlyModel`: the round trip would deterministically 404,
+ * so we short-circuit with the same Gemini-shaped error envelope. The shape
+ * matches `enhanceAgySdkErrorResponse` so `@ai-sdk/google` raises a normal
+ * `AI_APICallError` carrying the actionable message.
+ */
+export function createAntigravityOnlyModelErrorResponse(requestedModel: string): Response {
+  const body: GeminiErrorBody = {
+    error: {
+      code: 404,
+      message: buildAntigravityModelGuidanceMessage(requestedModel),
+      status: "NOT_FOUND",
+    },
+  };
+  return new Response(JSON.stringify(body), {
+    status: 404,
+    statusText: "Not Found",
+    headers: { "content-type": "application/json" },
   });
 }
 
