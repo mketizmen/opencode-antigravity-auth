@@ -2,6 +2,7 @@ import { exec } from "node:child_process";
 import { tool } from "@opencode-ai/plugin";
 import {
   ANTIGRAVITY_DEFAULT_PROJECT_ID,
+  ANTIGRAVITY_ENDPOINT,
   ANTIGRAVITY_ENDPOINT_FALLBACKS,
   ANTIGRAVITY_ENDPOINT_PROD,
   ANTIGRAVITY_PROVIDER_ID,
@@ -705,11 +706,9 @@ async function verifyAccountAccess(
     Authorization: `Bearer ${refreshedAuth.access}`,
     "Content-Type": "application/json",
   };
-  if (projectId) {
-    headers["x-goog-user-project"] = projectId;
-  }
 
   const requestBody = {
+    project: projectId,
     model: "gemini-3-flash",
     request: {
       model: "gemini-3-flash",
@@ -723,7 +722,7 @@ async function verifyAccountAccess(
 
   let response: Response;
   try {
-    response = await fetch(`${ANTIGRAVITY_ENDPOINT_PROD}/v1internal:streamGenerateContent?alt=sse`, {
+    response = await fetch(`${ANTIGRAVITY_ENDPOINT}/v1internal:streamGenerateContent?alt=sse`, {
       method: "POST",
       headers,
       body: JSON.stringify(requestBody),
@@ -3816,6 +3815,7 @@ function isExplicitQuotaFromUrl(urlString: string): boolean {
 export const __testExports = {
   getHeaderStyleFromUrl,
   createSoftQuotaBlockedResponse,
+  verifyAccountAccess,
   resolveHeaderRoutingDecision,
   resolveQuotaFallbackHeaderStyle,
 };
