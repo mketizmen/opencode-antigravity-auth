@@ -1670,9 +1670,48 @@ export const createAntigravityPlugin = (providerId: string) => async (
       // Cache getAuth for tool access
       cachedGetAuth = getAuth;
 
-      const auth = await getAuth();
-      const apiKeyAuth = isApiKeyAuth(auth) ? auth : null;
+      const initialAuth = await getAuth();
+      // Captured for the OAuth fetch handler's invalid_grant cleanup: only
+      // clear OpenCode's stored OAuth credentials when OpenCode itself WAS in
+      // OAuth mode at loader time. If we promote OAuth from disk over an
+      // API-key auth (oh-my-opencode case), wiping back via client.auth.set
+      // would corrupt that API-key state.
+      const initialAuthWasOAuth = isOAuthAuth(initialAuth);
+      const apiKeyAuth = isApiKeyAuth(initialAuth) ? initialAuth : null;
       const initialAgySdkCredentials = getAgySdkCredentials(config, apiKeyAuth);
+
+      // Promote disk-stored OAuth accounts ahead of the API-key-only branch.
+      // When OpenCode hands us non-OAuth auth (e.g. oh-my-opencode flips the
+      // google provider into API-key mode, or the user only ever ran OAuth via
+      // this plugin's own login flow), `~/.config/opencode/antigravity-accounts.json`
+      // may still hold usable OAuth refresh tokens. Synthesize an OAuth `auth`
+      // from the active disk account so antigravity-* / Claude requests route
+      // through the Antigravity OAuth backend instead of being short-circuited
+      // as 404s by the API-key-only interceptor below.
+      let auth = initialAuth;
+      if (!isOAuthAuth(initialAuth)) {
+        const diskAccounts = await loadAccounts();
+        const accountsOnDisk = diskAccounts?.accounts ?? [];
+        const candidateIndex = typeof diskAccounts?.activeIndex === "number"
+          && diskAccounts.activeIndex >= 0
+          && diskAccounts.activeIndex < accountsOnDisk.length
+          ? diskAccounts.activeIndex
+          : 0;
+        const activeAccount = accountsOnDisk[candidateIndex]
+          ?? accountsOnDisk.find((acc) => !!acc?.refreshToken);
+        if (activeAccount?.refreshToken) {
+          auth = {
+            type: "oauth",
+            refresh: formatRefreshParts({
+              refreshToken: activeAccount.refreshToken,
+              projectId: activeAccount.projectId,
+              managedProjectId: activeAccount.managedProjectId,
+            }),
+            access: "",
+            expires: 0,
+          };
+        }
+      }
        
       // If OpenCode has no valid OAuth auth, clear any stale account storage
       if (!isOAuthAuth(auth)) {
@@ -1769,8 +1808,13 @@ export const createAntigravityPlugin = (providerId: string) => async (
             return fetch(input, init);
           }
 
-          const latestAuth = await getAuth();
-          if (!isOAuthAuth(latestAuth)) {
+          // Fall back to the API-key-only sub-branch only when we have no
+          // usable OAuth accounts (e.g. all were removed via invalid_grant).
+          // Otherwise the OAuth/AccountManager flow below handles routing,
+          // including the Antigravity SDK / Gemini API-key fallback when
+          // quota is exhausted (see tryAgySdkFallbackForRequest).
+          if (accountManager.getAccountCount() === 0) {
+            const latestAuth = await getAuth();
             const latestCredentials = getAgySdkCredentials(config, isApiKeyAuth(latestAuth) ? latestAuth : null);
             const urlString = toUrlString(input);
             // Antigravity-only models can't be served by the public Gemini API
@@ -1794,14 +1838,11 @@ export const createAntigravityPlugin = (providerId: string) => async (
             return fetch(input, init);
           }
 
-          if (accountManager.getAccountCount() === 0) {
-            throw new Error("No Antigravity accounts configured. Run `opencode auth login`.");
-          }
 
           const urlString = toUrlString(input);
           const family = getModelFamilyFromUrl(urlString);
           const model = extractModelFromUrl(urlString);
-          const agySdkCredentials = getAgySdkCredentials(config, null);
+          const agySdkCredentials = getAgySdkCredentials(config, apiKeyAuth);
           const debugLines: string[] = [];
           const pushDebug = (line: string) => {
             if (!isDebugEnabled()) return;
@@ -2098,14 +2139,36 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   }
 
                   if (accountManager.getAccountCount() === 0) {
-                    try {
-                      await client.auth.set({
-                        path: { id: providerId },
-                        body: { type: "oauth", refresh: "", access: "", expires: 0 },
-                      });
-                    } catch (storeError) {
-                      log.error("Failed to clear stored Antigravity OAuth credentials", { error: String(storeError) });
+                    // Only clear OpenCode's stored OAuth credentials when OpenCode
+                    // was actually in OAuth mode at loader time. If we promoted
+                    // OAuth from disk over an API-key auth, OpenCode's provider
+                    // state IS api-key — wiping it would corrupt that.
+                    if (initialAuthWasOAuth) {
+                      try {
+                        await client.auth.set({
+                          path: { id: providerId },
+                          body: { type: "oauth", refresh: "", access: "", expires: 0 },
+                        });
+                      } catch (storeError) {
+                        log.error("Failed to clear stored Antigravity OAuth credentials", { error: String(storeError) });
+                      }
                     }
+
+                    // Mixed-mode safety net: when promoted-from-disk OAuth fully
+                    // fails but OpenCode has api-key auth (or env keys are configured)
+                    // and the model is routable via the public Gemini API, attempt
+                    // the api-key fallback before declaring the request unservable.
+                    // OAuth-only setups still see the helpful "invalid refresh tokens"
+                    // message since `tryAgySdkFallbackForRequest` returns null when
+                    // no api-key credentials are available.
+                    const fallback = await tryAgySdkFallbackForRequest(
+                      input,
+                      init,
+                      config,
+                      agySdkCredentials,
+                      urlString,
+                    );
+                    if (fallback) return fallback;
 
                     throw new Error(
                       "All Antigravity accounts have invalid refresh tokens. Run `opencode auth login` and reauthenticate.",

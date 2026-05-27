@@ -1,5 +1,5 @@
 import { extractVariantThinkingConfig } from "./request-helpers";
-import { applyGeminiTransforms, isGemini3Model, resolveModelForHeaderStyle } from "./transform";
+import { applyGeminiTransforms, isGemini3Model, mapAntigravityModelToPublicApi, resolveModelForHeaderStyle } from "./transform";
 import type { AntigravityConfig } from "./config";
 import type { GeminiApiModel } from "./config/models";
 import type { ApiKeyAuthDetails } from "./types";
@@ -133,13 +133,52 @@ export function isApiKeyAuth(auth: unknown): auth is ApiKeyAuthDetails {
 }
 
 /**
- * Returns true when the request can be safely routed through the public Gemini
- * API (`generativelanguage.googleapis.com`) using an API key.
+ * Classifies a model as servable by the public Gemini API via the api-key path,
+ * either natively or via translation in `prepareAgySdkGeminiRequest`.
  *
- * Requests for Antigravity-only Gemini ids (see `isLikelyAntigravityOnlyModel`)
- * are excluded: forwarding them to the public API yields a 404 NOT_FOUND because
- * those ids are served only by the Antigravity Code Assist backend. The caller
- * should fall back to the OAuth gemini-cli quota path instead.
+ * Strips the optional `antigravity-` prefix and any tier suffix (-minimal/-low/
+ * -medium/-high), then checks:
+ *  - Claude models: never servable on the public API → returns false.
+ *  - Has an explicit translation (e.g. `gemini-3.1-pro` → `gemini-3.1-pro-preview`)
+ *    via `mapAntigravityModelToPublicApi` → routable.
+ *  - Stripped id is NOT in the Antigravity-only denylist → assumed public-API
+ *    native (covers `antigravity-gemini-3.5-flash` → `gemini-3.5-flash`, which
+ *    the public API serves bare).
+ *
+ * Shared by `isAgySdkSupportedRequest` (positive gate) and
+ * `isAntigravityOnlyGenerativeLanguageRequest` (negative gate / synthetic-404 trigger).
+ */
+function canRouteAsPublicGeminiApiModel(model: string): boolean {
+  const m = model.toLowerCase();
+  if (m.includes("claude")) return false;
+  const isAntigravityPrefixed = m.startsWith("antigravity-");
+  const stripped = m.replace(/^antigravity-/, "").replace(/-(minimal|low|medium|high)$/, "");
+
+  // Explicit translation (e.g. gemini-3.1-pro → gemini-3.1-pro-preview) → routable.
+  if (mapAntigravityModelToPublicApi(stripped)) return true;
+
+  // For `antigravity-` prefixed inputs without a known mapping, require the
+  // stripped id to look like a Gemini-family id. Unknown antigravity-* ids
+  // (typos, hypotheticals) fall through to `isAntigravityOnlyGenerativeLanguageRequest`
+  // which short-circuits with the synthetic OAuth re-auth guidance — better UX
+  // than raw-forwarding to the public Gemini API and surfacing Google's 404.
+  if (isAntigravityPrefixed) {
+    return /^gemini-/.test(stripped) && !ANTIGRAVITY_ONLY_BARE_GEMINI_IDS.has(stripped);
+  }
+
+  // Bare (non-prefixed) inputs not in the Antigravity-only denylist are
+  // assumed to be public-API natives (e.g. gemini-3.5-flash, gemini-2.5-pro).
+  return !ANTIGRAVITY_ONLY_BARE_GEMINI_IDS.has(stripped);
+}
+
+/**
+ * Returns true when the request can be routed to the public Gemini API
+ * (`generativelanguage.googleapis.com`) via the api-key path — either natively
+ * or via translation in `prepareAgySdkGeminiRequest`.
+ *
+ * Antigravity-only models with no public-API equivalent (Claude ids, unmapped
+ * antigravity- prefixed non-Gemini ids) are excluded: the caller should stay on
+ * the OAuth Antigravity path or short-circuit with a synthetic error.
  */
 export function isAgySdkSupportedRequest(urlString: string): boolean {
   let url: URL;
@@ -151,18 +190,22 @@ export function isAgySdkSupportedRequest(urlString: string): boolean {
   if (url.hostname !== "generativelanguage.googleapis.com") return false;
   const model = extractGeminiModelFromUrl(url.toString());
   if (!model || !model.toLowerCase().includes("gemini")) return false;
-  if (isLikelyAntigravityOnlyModel(model)) return false;
-  return true;
+  return canRouteAsPublicGeminiApiModel(model);
 }
 
 /**
- * Returns true when the URL targets `generativelanguage.googleapis.com` with a
- * model id served only by the Antigravity Code Assist backend (e.g.
- * `gemini-3.1-pro`, `gemini-3-pro`, `gemini-3-flash`, `gemini-3.1-flash`).
+ * Returns true when the URL targets `generativelanguage.googleapis.com` with an
+ * Antigravity-only model that CANNOT be served by the public Gemini API even
+ * with translation — Claude ids and unmapped antigravity- prefixed non-Gemini ids.
  *
- * Use this in API-key-only auth paths to short-circuit the request with a
- * helpful synthetic error (via `createAntigravityOnlyModelErrorResponse`)
- * instead of forwarding to the public Gemini API where it would 404.
+ * Translatable Antigravity-only Gemini ids (e.g. `antigravity-gemini-3.1-pro`,
+ * bare `gemini-3.1-pro`) and Antigravity-prefixed public-API natives (e.g.
+ * `antigravity-gemini-3.5-flash` → `gemini-3.5-flash`) return false here —
+ * `prepareAgySdkGeminiRequest` rewrites them to the public-API equivalent.
+ *
+ * Use this in API-key-only auth paths to short-circuit with a helpful synthetic
+ * error (via `createAntigravityOnlyModelErrorResponse`) instead of forwarding to
+ * the public Gemini API where it would 404.
  */
 export function isAntigravityOnlyGenerativeLanguageRequest(urlString: string): boolean {
   let url: URL;
@@ -174,7 +217,7 @@ export function isAntigravityOnlyGenerativeLanguageRequest(urlString: string): b
   if (url.hostname !== "generativelanguage.googleapis.com") return false;
   const model = extractGeminiModelFromUrl(url.toString());
   if (!model) return false;
-  return isLikelyAntigravityOnlyModel(model);
+  return isLikelyAntigravityOnlyModel(model) && !canRouteAsPublicGeminiApiModel(model);
 }
 
 /**

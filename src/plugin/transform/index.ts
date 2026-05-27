@@ -19,6 +19,7 @@ export type {
 
 // Model resolution
 export {
+  mapAntigravityModelToPublicApi,
   resolveModelWithTier,
   resolveModelWithVariant,
   resolveModelForHeaderStyle,
