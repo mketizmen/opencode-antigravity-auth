@@ -9,6 +9,7 @@ import {
 import { DEFAULT_CONFIG } from "./config";
 import { initializeDebug } from "./debug";
 import { SKIP_THOUGHT_SIGNATURE } from "../constants";
+import { cacheSignature, getCachedSignature, clearSignatureCache } from "./cache";
 import * as config from "./config";
 import type { SignatureStore, ThoughtBuffer, StreamingCallbacks, StreamingOptions } from "./core/streaming/types";
 
@@ -22,6 +23,8 @@ const {
   isGeminiToolUsePart,
   isGeminiThinkingPart,
   ensureThoughtSignature,
+  sanitizeRequestPayloadForAntigravity,
+  signatureCacheProjectKey,
   hasSignedThinkingPart,
   hasToolUseInContents,
   hasSignedThinkingInContents,
@@ -1482,5 +1485,110 @@ it("removes API key headers", () => {
         ),
       ).rejects.toMatchObject({ message: "THINKING_RECOVERY_NEEDED" });
     });
+  });
+});
+
+describe("Gemini-3 thought signature restore (sanitizeRequestPayloadForAntigravity)", () => {
+  // Loop ②: For multi-turn Gemini-3 function calling, the response side caches the
+  // model's thoughtSignature, but the request side previously had no Gemini path to
+  // restore it — it always stamped the sentinel. Losing the signed chain-of-thought
+  // every turn made the model re-derive the same plan forever (the "Phase 3P" loop).
+  it("restores the cached thoughtSignature onto the functionCall part instead of the sentinel", () => {
+    const sessionKey = "gemini3-restore-spec";
+    clearSignatureCache(sessionKey);
+    const realSignature = "g".repeat(MIN_SIGNATURE_LENGTH + 12);
+    const thoughtText = "I should search the workspace for Phase 3P.";
+    cacheSignature(sessionKey, thoughtText, realSignature);
+
+    const payload: any = {
+      contents: [
+        {
+          role: "model",
+          parts: [
+            { thought: true, text: thoughtText },
+            { functionCall: { name: "grep", args: { pattern: "Phase 3P" } } },
+          ],
+        },
+      ],
+    };
+
+    sanitizeRequestPayloadForAntigravity(payload, { sessionKey, getSignature: getCachedSignature });
+
+    const fnPart = payload.contents[0].parts.find((p: any) => p.functionCall);
+    expect(fnPart.thoughtSignature).toBe(realSignature);
+    expect(fnPart.thought_signature).toBe(realSignature);
+    expect(fnPart.thoughtSignature).not.toBe(SKIP_THOUGHT_SIGNATURE);
+  });
+
+  it("falls back to the sentinel when no signature is cached (preserves today's behavior)", () => {
+    const sessionKey = "gemini3-restore-miss-spec";
+    clearSignatureCache(sessionKey);
+
+    const payload: any = {
+      contents: [
+        {
+          role: "model",
+          parts: [
+            { thought: true, text: "uncached reasoning" },
+            { functionCall: { name: "grep", args: {} } },
+          ],
+        },
+      ],
+    };
+
+    sanitizeRequestPayloadForAntigravity(payload, { sessionKey, getSignature: getCachedSignature });
+
+    const fnPart = payload.contents[0].parts.find((p: any) => p.functionCall);
+    expect(fnPart.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+  });
+
+  it("still stamps the sentinel when no restore options are provided (Claude/legacy path)", () => {
+    const payload: any = {
+      contents: [
+        {
+          role: "model",
+          parts: [
+            { thought: true, text: "no restore opts" },
+            { functionCall: { name: "grep", args: {} } },
+          ],
+        },
+      ],
+    };
+
+    sanitizeRequestPayloadForAntigravity(payload);
+
+    const fnPart = payload.contents[0].parts.find((p: any) => p.functionCall);
+    expect(fnPart.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+  });
+});
+
+describe("signatureCacheProjectKey (Defect 2: project-independent key for Gemini-3)", () => {
+  // Gemini-3 thought signatures are content-derived, not project-scoped, and the
+  // API only strictly validates the current turn (verified via API docs + log
+  // forensics). Keeping the signature cache key project-independent lets reasoning
+  // continuity survive quota-driven account/project switches — otherwise the key
+  // changes on switch, the cache misses, and the model re-plans the same step.
+  it("drops the project component for Gemini-3 so the key is identical across projects", () => {
+    expect(signatureCacheProjectKey("gemini-3-pro", "project-A")).toBeUndefined();
+    expect(signatureCacheProjectKey("antigravity-gemini-3-flash", "project-B")).toBeUndefined();
+
+    const keyA = buildSignatureSessionKey(
+      "sess",
+      "gemini-3-pro",
+      "conv-1",
+      signatureCacheProjectKey("gemini-3-pro", "project-A"),
+    );
+    const keyB = buildSignatureSessionKey(
+      "sess",
+      "gemini-3-pro",
+      "conv-1",
+      signatureCacheProjectKey("gemini-3-pro", "project-B"),
+    );
+    expect(keyA).toBe(keyB);
+  });
+
+  it("preserves the project component for Claude (unchanged partitioning)", () => {
+    expect(signatureCacheProjectKey("claude-opus-4-6-thinking", "project-A")).toBe("project-A");
+    expect(signatureCacheProjectKey("gemini-2.5-pro", "project-A")).toBe("project-A");
   });
 });

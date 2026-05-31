@@ -108,6 +108,27 @@ function shouldCacheThinkingSignatures(model?: string): boolean {
   return lower.includes("claude") || lower.includes("gemini-3");
 }
 
+/**
+ * Returns the project component to use in the thinking-signature cache key.
+ *
+ * Gemini 3 thought signatures are content-derived (not project/account-scoped)
+ * and the API only strictly validates function calls in the current turn, so we
+ * keep Gemini-3's signature cache key project-independent. This preserves
+ * reasoning continuity across quota-driven account/project switches: otherwise
+ * the key changes on a switch, the cache misses, the validation-bypass sentinel
+ * is sent instead of the real signature, and the model loses its chain-of-thought
+ * and re-plans the same step forever. Claude keeps project partitioning.
+ */
+function signatureCacheProjectKey(
+  model: string | undefined,
+  projectKey: string | undefined,
+): string | undefined {
+  if (typeof model === "string" && model.toLowerCase().includes("gemini-3")) {
+    return undefined;
+  }
+  return projectKey;
+}
+
 function hashConversationSeed(seed: string): string {
   return crypto.createHash("sha256").update(seed, "utf8").digest("hex").slice(0, 16);
 }
@@ -356,7 +377,13 @@ function isValidRequestPart(part: unknown): boolean {
   );
 }
 
-function sanitizeRequestPayloadForAntigravity(payload: Record<string, unknown>): void {
+function sanitizeRequestPayloadForAntigravity(
+  payload: Record<string, unknown>,
+  restore?: {
+    sessionKey: string;
+    getSignature: (sessionId: string, text: string) => string | undefined;
+  },
+): void {
   const anyPayload = payload as any;
 
   if (Array.isArray(anyPayload.contents)) {
@@ -370,6 +397,30 @@ function sanitizeRequestPayloadForAntigravity(payload: Record<string, unknown>):
         const rawParts = Array.isArray(contentRecord.parts) ? contentRecord.parts : [];
         let foundFirstFunctionCall = false;
 
+        // Gemini 3 multi-turn function calling requires the model's prior
+        // thoughtSignature to be replayed so it can continue its signed
+        // chain-of-thought. When enabled, recover the real signature we cached
+        // from the response (keyed by this block's thinking text) and use it
+        // instead of the validation-bypass sentinel. Without this the model
+        // loses reasoning continuity and re-plans the same step forever.
+        let restoredThoughtSignature: string | undefined;
+        if (restore?.sessionKey) {
+          for (const candidatePart of rawParts) {
+            if (!candidatePart || typeof candidatePart !== "object" || (candidatePart as any).thought !== true) {
+              continue;
+            }
+            const thoughtText = getThinkingPartText(candidatePart);
+            if (!thoughtText) {
+              continue;
+            }
+            const cached = restore.getSignature(restore.sessionKey, thoughtText);
+            if (cached && cached.length >= MIN_SIGNATURE_LENGTH && cached !== SKIP_THOUGHT_SIGNATURE) {
+              restoredThoughtSignature = cached;
+              break;
+            }
+          }
+        }
+
         const sanitizedParts = rawParts.filter(isValidRequestPart).map((part: any) => {
           if (part && typeof part === "object" && part.functionCall) {
             let sig = part.thoughtSignature || part.thought_signature;
@@ -380,7 +431,7 @@ function sanitizeRequestPayloadForAntigravity(payload: Record<string, unknown>):
             if (!foundFirstFunctionCall) {
               foundFirstFunctionCall = true;
               if (!sig || sig.length < MIN_SIGNATURE_LENGTH) {
-                sig = SKIP_THOUGHT_SIGNATURE;
+                sig = restoredThoughtSignature ?? SKIP_THOUGHT_SIGNATURE;
               }
             } else {
               // Parallel function calls MUST NOT have a signature
@@ -963,7 +1014,7 @@ export function prepareAntigravityRequest(
     PLUGIN_SESSION_ID,
     effectiveModel,
     undefined,
-    resolveProjectKey(projectId),
+    signatureCacheProjectKey(effectiveModel, resolveProjectKey(projectId)),
   );
 
   let body = baseInit.body;
@@ -1027,7 +1078,7 @@ export function prepareAntigravityRequest(
         // Strip tier suffix from model for cache key to prevent cache misses on tier change
         // e.g., "claude-opus-4-6-thinking-high" -> "claude-opus-4-6-thinking"
         const modelForCacheKey = effectiveModel.replace(/-(minimal|low|medium|high)$/i, "");
-        signatureSessionKey = buildSignatureSessionKey(PLUGIN_SESSION_ID, modelForCacheKey, conversationKey, resolveProjectKey(parsedBody.project));
+        signatureSessionKey = buildSignatureSessionKey(PLUGIN_SESSION_ID, modelForCacheKey, conversationKey, signatureCacheProjectKey(modelForCacheKey, resolveProjectKey(parsedBody.project)));
 
         if (requestObjects.length > 0) {
           sessionId = signatureSessionKey;
@@ -1494,7 +1545,7 @@ export function prepareAntigravityRequest(
         }
 
         const conversationKey = resolveConversationKey(requestPayload);
-        signatureSessionKey = buildSignatureSessionKey(PLUGIN_SESSION_ID, effectiveModel, conversationKey, resolveProjectKey(projectId));
+        signatureSessionKey = buildSignatureSessionKey(PLUGIN_SESSION_ID, effectiveModel, conversationKey, signatureCacheProjectKey(effectiveModel, resolveProjectKey(projectId)));
 
         // For Claude models, filter out unsigned thinking blocks (required by Claude API)
         // Attempts to restore signatures from cache for multi-turn conversations
@@ -1639,7 +1690,19 @@ export function prepareAntigravityRequest(
         }
 
         stripInjectedDebugFromRequestPayload(requestPayload);
-        sanitizeRequestPayloadForAntigravity(requestPayload);
+        // Gemini 3 caches thought signatures on the response side but, unlike
+        // Claude, had no request-side path to replay them — so restore the
+        // cached signature here. Without it the model loses reasoning
+        // continuity across turns (worsened by quota-driven account switches)
+        // and re-plans the same step forever.
+        const restoreGeminiThoughtSignatures =
+          !isClaude && shouldCacheThinkingSignatures(effectiveModel);
+        sanitizeRequestPayloadForAntigravity(
+          requestPayload,
+          restoreGeminiThoughtSignatures
+            ? { sessionKey: signatureSessionKey, getSignature: getCachedSignature }
+            : undefined,
+        );
 
         const effectiveProjectId = projectId?.trim() || (headerStyle === "antigravity" ? generateSyntheticProjectId() : "");
         resolvedProjectId = effectiveProjectId;
@@ -2054,6 +2117,8 @@ export const __testExports = {
   hasToolUseInMessages,
   ensureThinkingBeforeToolUseInContents,
   ensureThinkingBeforeToolUseInMessages,
+  sanitizeRequestPayloadForAntigravity,
+  signatureCacheProjectKey,
   generateSyntheticProjectId,
   MIN_SIGNATURE_LENGTH,
   transformSseLine,
