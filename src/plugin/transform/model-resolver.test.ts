@@ -67,6 +67,46 @@ describe("resolveModelWithTier", () => {
     });
   });
 
+  describe("agy-sdk model normalization", () => {
+    it("preserves API-native preview model ids", () => {
+      const result = resolveModelForHeaderStyle("gemini-3-pro-preview", "agy-sdk");
+
+      expect(result.actualModel).toBe("gemini-3-pro-preview");
+      expect(result.thinkingLevel).toBe("low");
+      expect(result.quotaPreference).toBe("agy-sdk");
+    });
+
+    it("translates Antigravity-only ids to the public Gemini API equivalent", () => {
+      const result = resolveModelForHeaderStyle("antigravity-gemini-3-pro-high", "agy-sdk");
+
+      expect(result.actualModel).toBe("gemini-3-pro-preview");
+      expect(result.thinkingLevel).toBe("high");
+      expect(result.quotaPreference).toBe("agy-sdk");
+    });
+
+    it("translates each known Antigravity-only Gemini id to its public-API equivalent", () => {
+      const cases: Array<[string, string]> = [
+        ["antigravity-gemini-3-pro", "gemini-3-pro-preview"],
+        ["antigravity-gemini-3-flash-medium", "gemini-3-flash-preview"],
+        ["antigravity-gemini-3.1-pro-low", "gemini-3.1-pro-preview"],
+        ["antigravity-gemini-3.1-flash", "gemini-3.1-flash-lite"],
+        ["gemini-3-pro", "gemini-3-pro-preview"],
+        ["gemini-3.1-pro", "gemini-3.1-pro-preview"],
+      ];
+      for (const [input, expected] of cases) {
+        const result = resolveModelForHeaderStyle(input, "agy-sdk");
+        expect(result.actualModel, `input=${input}`).toBe(expected);
+        expect(result.quotaPreference).toBe("agy-sdk");
+      }
+    });
+
+    it("passes non-Antigravity-only Gemini ids through unchanged", () => {
+      // gemini-3.5-flash IS served bare on the public API — no translation needed.
+      const result = resolveModelForHeaderStyle("antigravity-gemini-3.5-flash", "agy-sdk");
+      expect(result.actualModel).toBe("gemini-3.5-flash");
+    });
+  });
+
   describe("cli_first quota preference", () => {
     it("prefers gemini-cli when cli_first is true and no prefix is set", () => {
       const result = resolveModelWithTier("gemini-3-flash", { cli_first: true });
@@ -334,6 +374,12 @@ describe("Issue #103: resolveModelForHeaderStyle", () => {
     it("transforms gemini-3-pro-low to gemini-3-pro-preview for gemini-cli", () => {
       const result = resolveModelForHeaderStyle("gemini-3-pro-low", "gemini-cli");
       expect(result.actualModel).toBe("gemini-3-pro-preview");
+      expect(result.quotaPreference).toBe("gemini-cli");
+    });
+
+    it("strips the minimal tier before adding Gemini CLI preview suffix", () => {
+      const result = resolveModelForHeaderStyle("gemini-3-flash-minimal", "gemini-cli");
+      expect(result.actualModel).toBe("gemini-3-flash-preview");
       expect(result.quotaPreference).toBe("gemini-cli");
     });
 

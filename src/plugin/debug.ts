@@ -230,15 +230,15 @@ export function startAntigravityDebugRequest(meta: AntigravityDebugRequestMeta):
 
   const id = `ANTIGRAVITY-${++requestCounter}`;
   const method = meta.method ?? "GET";
-  logDebug(`[Antigravity Debug ${id}] pid=${process.pid} ${method} ${meta.resolvedUrl}`);
+  logDebug(`[Antigravity Debug ${id}] pid=${process.pid} ${method} ${sanitizeUrlForLog(meta.resolvedUrl)}`);
   if (meta.originalUrl && meta.originalUrl !== meta.resolvedUrl) {
-    logDebug(`[Antigravity Debug ${id}] Original URL: ${meta.originalUrl}`);
+    logDebug(`[Antigravity Debug ${id}] Original URL: ${sanitizeUrlForLog(meta.originalUrl)}`);
   }
   if (meta.projectId) {
     logDebug(`[Antigravity Debug ${id}] Project: ${meta.projectId}`);
   }
   logDebug(`[Antigravity Debug ${id}] Streaming: ${meta.streaming ? "yes" : "no"}`);
-  logDebug(`[Antigravity Debug ${id}] Headers: ${JSON.stringify(maskHeaders(meta.headers))}`);
+  logDebug(`[Antigravity Debug ${id}] Headers: ${JSON.stringify(maskHeadersForLog(meta.headers))}`);
   const bodyPreview = formatBodyPreviewForLog(meta.body, MAX_BODY_PREVIEW_CHARS);
   if (bodyPreview) {
     logDebug(`[Antigravity Debug ${id}] Body Preview: ${bodyPreview}`);
@@ -266,7 +266,7 @@ export function logAntigravityDebugResponse(
   );
   logDebug(
     `[Antigravity Debug ${context.id}] Response Headers: ${JSON.stringify(
-      maskHeaders(meta.headersOverride ?? response.headers),
+      maskHeadersForLog(meta.headersOverride ?? response.headers),
     )}`,
   );
 
@@ -288,7 +288,7 @@ export function logAntigravityDebugResponse(
 /**
  * Obscures sensitive headers and returns a plain object for logging.
  */
-function maskHeaders(headers?: HeadersInit | Headers): Record<string, string> {
+export function maskHeadersForLog(headers?: HeadersInit | Headers): Record<string, string> {
   if (!headers) {
     return {};
   }
@@ -296,13 +296,32 @@ function maskHeaders(headers?: HeadersInit | Headers): Record<string, string> {
   const result: Record<string, string> = {};
   const parsed = headers instanceof Headers ? headers : new Headers(headers);
   parsed.forEach((value, key) => {
-    if (key.toLowerCase() === "authorization") {
+    if (isSensitiveHeader(key)) {
       result[key] = "[redacted]";
     } else {
       result[key] = value;
     }
   });
   return result;
+}
+
+function isSensitiveHeader(key: string): boolean {
+  const normalized = key.toLowerCase();
+  return normalized === "authorization"
+    || normalized === "proxy-authorization"
+    || normalized.includes("api-key");
+}
+
+export function sanitizeUrlForLog(urlString: string): string {
+  try {
+    const url = new URL(urlString);
+    if (url.searchParams.has("key")) {
+      url.searchParams.set("key", "[redacted]");
+    }
+    return url.toString();
+  } catch {
+    return urlString.replace(/([?&]key=)[^&\s]+/gi, "$1[redacted]");
+  }
 }
 
 /**
@@ -417,7 +436,7 @@ export async function logResponseBody(
 
 export function logModelFamily(url: string, extractedModel: string | null, family: string): void {
   runWithDebugEnabled(() => {
-    logDebug(`[ModelFamily] url=${url} model=${extractedModel ?? "unknown"} family=${family}`);
+    logDebug(`[ModelFamily] url=${sanitizeUrlForLog(url)} model=${extractedModel ?? "unknown"} family=${family}`);
   });
 }
 

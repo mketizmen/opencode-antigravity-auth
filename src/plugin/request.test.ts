@@ -9,6 +9,7 @@ import {
 import { DEFAULT_CONFIG } from "./config";
 import { initializeDebug } from "./debug";
 import { SKIP_THOUGHT_SIGNATURE } from "../constants";
+import { cacheSignature, getCachedSignature, clearSignatureCache } from "./cache";
 import * as config from "./config";
 import type { SignatureStore, ThoughtBuffer, StreamingCallbacks, StreamingOptions } from "./core/streaming/types";
 
@@ -22,6 +23,8 @@ const {
   isGeminiToolUsePart,
   isGeminiThinkingPart,
   ensureThoughtSignature,
+  sanitizeRequestPayloadForAntigravity,
+  signatureCacheProjectKey,
   hasSignedThinkingPart,
   hasToolUseInContents,
   hasSignedThinkingInContents,
@@ -79,10 +82,12 @@ describe("request.ts", () => {
   describe("isGenerativeLanguageRequest", () => {
     it("returns true for generativelanguage.googleapis.com URLs", () => {
       expect(isGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1/models")).toBe(true);
+      expect(isGenerativeLanguageRequest(new Request("https://generativelanguage.googleapis.com/v1/models"))).toBe(true);
     });
 
     it("returns false for other URLs", () => {
       expect(isGenerativeLanguageRequest("https://api.anthropic.com/v1/messages")).toBe(false);
+      expect(isGenerativeLanguageRequest("https://example.com/redirect?next=https://generativelanguage.googleapis.com/v1/models")).toBe(false);
     });
 
     it("returns false for non-string inputs", () => {
@@ -555,6 +560,61 @@ describe("request.ts", () => {
       expect(result.streaming).toBe(false);
     });
 
+    it("intercepts Request object inputs for generative language URLs", async () => {
+      const request = new Request(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=secret",
+        {
+          method: "POST",
+          headers: { "x-goog-api-key": "old-google-key" },
+          body: JSON.stringify({ contents: [] }),
+        },
+      );
+
+      const result = await prepareAntigravityRequest(
+        request,
+        undefined,
+        mockAccessToken,
+        mockProjectId,
+      );
+
+      const headers = result.init.headers as Headers;
+      expect(result.request).toBe("https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:generateContent");
+      expect(headers.get("Authorization")).toBe("Bearer test-token");
+      expect(headers.get("x-goog-api-key")).toBeNull();
+      expect(result.init.method).toBe("POST");
+      expect(JSON.parse(String(result.init.body))).toMatchObject({
+        model: "gemini-pro",
+        request: {
+          contents: [],
+        },
+      });
+    });
+
+    it("merges Request headers with init headers while preserving init precedence", async () => {
+      const request = new Request(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-request-id": "from-request",
+          },
+          body: JSON.stringify({ contents: [] }),
+        },
+      );
+
+      const result = await prepareAntigravityRequest(
+        request,
+        { headers: { "x-request-id": "from-init" } },
+        mockAccessToken,
+        mockProjectId,
+      );
+
+      const headers = new Headers(result.init.headers);
+      expect(headers.get("content-type")).toBe("application/json");
+      expect(headers.get("x-request-id")).toBe("from-init");
+    });
+
     it("detects streaming from generateStreamContent action", () => {
       const result = prepareAntigravityRequest(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:streamGenerateContent",
@@ -586,15 +646,20 @@ describe("request.ts", () => {
       expect(headers.get("Authorization")).toBe("Bearer test-token");
     });
 
-it("removes x-api-key header", () => {
+it("removes API key headers", () => {
       const result = prepareAntigravityRequest(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
-        { method: "POST", body: JSON.stringify({ contents: [] }), headers: { "x-api-key": "old-key" } },
+        {
+          method: "POST",
+          body: JSON.stringify({ contents: [] }),
+          headers: { "x-api-key": "old-key", "x-goog-api-key": "old-google-key" },
+        },
         mockAccessToken,
         mockProjectId
       );
       const headers = result.init.headers as Headers;
       expect(headers.get("x-api-key")).toBeNull();
+      expect(headers.get("x-goog-api-key")).toBeNull();
     });
 
     it("removes x-goog-user-project header for antigravity headerStyle", () => {
@@ -1420,5 +1485,110 @@ it("removes x-api-key header", () => {
         ),
       ).rejects.toMatchObject({ message: "THINKING_RECOVERY_NEEDED" });
     });
+  });
+});
+
+describe("Gemini-3 thought signature restore (sanitizeRequestPayloadForAntigravity)", () => {
+  // Loop ②: For multi-turn Gemini-3 function calling, the response side caches the
+  // model's thoughtSignature, but the request side previously had no Gemini path to
+  // restore it — it always stamped the sentinel. Losing the signed chain-of-thought
+  // every turn made the model re-derive the same plan forever (the "Phase 3P" loop).
+  it("restores the cached thoughtSignature onto the functionCall part instead of the sentinel", () => {
+    const sessionKey = "gemini3-restore-spec";
+    clearSignatureCache(sessionKey);
+    const realSignature = "g".repeat(MIN_SIGNATURE_LENGTH + 12);
+    const thoughtText = "I should search the workspace for Phase 3P.";
+    cacheSignature(sessionKey, thoughtText, realSignature);
+
+    const payload: any = {
+      contents: [
+        {
+          role: "model",
+          parts: [
+            { thought: true, text: thoughtText },
+            { functionCall: { name: "grep", args: { pattern: "Phase 3P" } } },
+          ],
+        },
+      ],
+    };
+
+    sanitizeRequestPayloadForAntigravity(payload, { sessionKey, getSignature: getCachedSignature });
+
+    const fnPart = payload.contents[0].parts.find((p: any) => p.functionCall);
+    expect(fnPart.thoughtSignature).toBe(realSignature);
+    expect(fnPart.thought_signature).toBe(realSignature);
+    expect(fnPart.thoughtSignature).not.toBe(SKIP_THOUGHT_SIGNATURE);
+  });
+
+  it("falls back to the sentinel when no signature is cached (preserves today's behavior)", () => {
+    const sessionKey = "gemini3-restore-miss-spec";
+    clearSignatureCache(sessionKey);
+
+    const payload: any = {
+      contents: [
+        {
+          role: "model",
+          parts: [
+            { thought: true, text: "uncached reasoning" },
+            { functionCall: { name: "grep", args: {} } },
+          ],
+        },
+      ],
+    };
+
+    sanitizeRequestPayloadForAntigravity(payload, { sessionKey, getSignature: getCachedSignature });
+
+    const fnPart = payload.contents[0].parts.find((p: any) => p.functionCall);
+    expect(fnPart.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+  });
+
+  it("still stamps the sentinel when no restore options are provided (Claude/legacy path)", () => {
+    const payload: any = {
+      contents: [
+        {
+          role: "model",
+          parts: [
+            { thought: true, text: "no restore opts" },
+            { functionCall: { name: "grep", args: {} } },
+          ],
+        },
+      ],
+    };
+
+    sanitizeRequestPayloadForAntigravity(payload);
+
+    const fnPart = payload.contents[0].parts.find((p: any) => p.functionCall);
+    expect(fnPart.thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+  });
+});
+
+describe("signatureCacheProjectKey (Defect 2: project-independent key for Gemini-3)", () => {
+  // Gemini-3 thought signatures are content-derived, not project-scoped, and the
+  // API only strictly validates the current turn (verified via API docs + log
+  // forensics). Keeping the signature cache key project-independent lets reasoning
+  // continuity survive quota-driven account/project switches — otherwise the key
+  // changes on switch, the cache misses, and the model re-plans the same step.
+  it("drops the project component for Gemini-3 so the key is identical across projects", () => {
+    expect(signatureCacheProjectKey("gemini-3-pro", "project-A")).toBeUndefined();
+    expect(signatureCacheProjectKey("antigravity-gemini-3-flash", "project-B")).toBeUndefined();
+
+    const keyA = buildSignatureSessionKey(
+      "sess",
+      "gemini-3-pro",
+      "conv-1",
+      signatureCacheProjectKey("gemini-3-pro", "project-A"),
+    );
+    const keyB = buildSignatureSessionKey(
+      "sess",
+      "gemini-3-pro",
+      "conv-1",
+      signatureCacheProjectKey("gemini-3-pro", "project-B"),
+    );
+    expect(keyA).toBe(keyB);
+  });
+
+  it("preserves the project component for Claude (unchanged partitioning)", () => {
+    expect(signatureCacheProjectKey("claude-opus-4-6-thinking", "project-A")).toBe("project-A");
+    expect(signatureCacheProjectKey("gemini-2.5-pro", "project-A")).toBe("project-A");
   });
 });

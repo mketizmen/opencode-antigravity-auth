@@ -145,7 +145,7 @@ export function getRandomizedHeaders(style: HeaderStyle, model?: string): Header
   };
 }
 
-export type HeaderStyle = "antigravity" | "gemini-cli";
+export type HeaderStyle = "antigravity" | "gemini-cli" | "agy-sdk";
 
 /**
  * Provider identifier shared between the plugin loader and credential store.

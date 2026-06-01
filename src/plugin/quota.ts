@@ -62,11 +62,11 @@ export interface AccountQuotaResult {
   updatedAccount?: AccountMetadataV3;
 }
 
-interface FetchAvailableModelsResponse {
+export interface FetchAvailableModelsResponse {
   models?: Record<string, FetchAvailableModelEntry>;
 }
 
-interface FetchAvailableModelEntry {
+export interface FetchAvailableModelEntry {
   quotaInfo?: {
     remainingFraction?: number;
     resetTime?: string;
@@ -143,24 +143,13 @@ function aggregateQuota(models?: Record<string, FetchAvailableModelEntry>): Quot
 
     const existing = groups[group];
     const nextCount = (existing?.modelCount ?? 0) + 1;
-    const nextRemaining =
-      remainingFraction === undefined
-        ? existing?.remainingFraction
-        : existing?.remainingFraction === undefined
-          ? remainingFraction
-          : Math.min(existing.remainingFraction, remainingFraction);
-
-    let nextResetTime = existing?.resetTime;
-    if (resetTimestamp !== null) {
-      if (!existing?.resetTime) {
-        nextResetTime = resetTime;
-      } else {
-        const existingTimestamp = parseResetTime(existing.resetTime);
-        if (existingTimestamp === null || resetTimestamp < existingTimestamp) {
-          nextResetTime = resetTime;
-        }
-      }
-    }
+    const useCurrentQuota =
+      remainingFraction !== undefined &&
+      (existing?.remainingFraction === undefined || remainingFraction > existing.remainingFraction);
+    const nextRemaining = useCurrentQuota ? remainingFraction : existing?.remainingFraction;
+    const nextResetTime = useCurrentQuota
+      ? resetTime
+      : existing?.resetTime ?? (resetTimestamp === null ? undefined : resetTime);
 
     groups[group] = {
       remainingFraction: nextRemaining,
@@ -182,7 +171,7 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = F
   }
 }
 
-async function fetchAvailableModels(
+export async function fetchAvailableModels(
   accessToken: string,
   projectId: string,
 ): Promise<FetchAvailableModelsResponse> {
@@ -340,7 +329,7 @@ export async function checkAccountsQuota(
       // Fetch both Antigravity and Gemini CLI quotas in parallel
       const [antigravityResponse, geminiCliResponse] = await Promise.all([
         fetchAvailableModels(auth.access ?? "", projectContext.effectiveProjectId)
-          .catch((error): FetchAvailableModelsResponse => ({ models: undefined })),
+          .catch((): FetchAvailableModelsResponse => ({ models: undefined })),
         fetchGeminiCliQuota(auth.access ?? "", projectContext.effectiveProjectId),
       ]);
 
@@ -392,4 +381,8 @@ export async function checkAccountsQuota(
 
   logQuotaFetch("complete", accounts.length, `ok=${results.filter(r => r.status === "ok").length} errors=${results.filter(r => r.status === "error").length}`);
   return results;
+}
+
+export const __testExports = {
+  aggregateQuota,
 }

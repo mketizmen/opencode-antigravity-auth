@@ -97,6 +97,34 @@ describe("AccountManager", () => {
     expect(next).toBeNull();
   });
 
+  it("skips accounts listed in excludeIndices (lets the retry loop make progress)", () => {
+    const stored: AccountStorageV4 = {
+      version: 4,
+      accounts: [
+        { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+        { refreshToken: "r2", projectId: "p2", addedAt: 1, lastUsed: 0 },
+        { refreshToken: "r3", projectId: "p3", addedAt: 1, lastUsed: 0 },
+      ],
+      activeIndex: 0,
+    };
+
+    const manager = new AccountManager(undefined, stored);
+    const family: ModelFamily = "gemini";
+    const model = "antigravity-gemini-3.1-pro";
+
+    // Excluding accounts 0 and 1 must yield account 2 — never an excluded one.
+    const selected = manager.getCurrentOrNextForFamily(
+      family, model, "hybrid", "antigravity", false, 100, 600_000, new Set([0, 1]),
+    );
+    expect(selected?.index).toBe(2);
+
+    // Excluding every account must yield null (so the caller stops switching).
+    const none = manager.getCurrentOrNextForFamily(
+      family, model, "hybrid", "antigravity", false, 100, 600_000, new Set([0, 1, 2]),
+    );
+    expect(none).toBeNull();
+  });
+
   it("un-rate-limits accounts after timeout expires", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(0));
@@ -1633,6 +1661,24 @@ describe("AccountManager", () => {
       manager.updateQuotaCache(1, { claude: { remainingFraction: 0.08, modelCount: 1 } });
 
       const account = manager.getCurrentOrNextForFamily("claude", null, "sticky", "antigravity", false, 90);
+      expect(account).toBeNull();
+    });
+
+    it("returns null in hybrid mode when every account is over soft quota threshold", () => {
+      const stored: AccountStorageV4 = {
+        version: 4,
+        accounts: [
+          { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+          { refreshToken: "r2", projectId: "p2", addedAt: 2, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      manager.updateQuotaCache(0, { "gemini-pro": { remainingFraction: 0, modelCount: 1 } });
+      manager.updateQuotaCache(1, { "gemini-pro": { remainingFraction: 0, modelCount: 1 } });
+
+      const account = manager.getCurrentOrNextForFamily("gemini", null, "hybrid", "antigravity", false, 90);
       expect(account).toBeNull();
     });
 

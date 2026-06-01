@@ -41,6 +41,41 @@ export type ToastScope = z.infer<typeof ToastScopeSchema>;
 export const SchedulingModeSchema = z.enum(['cache_first', 'balance', 'performance_first']);
 export type SchedulingMode = z.infer<typeof SchedulingModeSchema>;
 
+export const AgySdkCloudProjectSchema = z.object({
+  label: z.string().optional(),
+  api_key: z.string().trim().min(1, "api_key must not be empty"),
+  project_id: z.string().optional(),
+  enabled: z.boolean().default(true),
+});
+
+export const AgySdkConfigSchema = z.object({
+  /** Enable the newer Antigravity SDK/Gemini API path for API-key credentials. */
+  enabled: z.boolean().default(true),
+
+  /** Prefer API-key projects for Gemini requests when OAuth credentials are also present. */
+  prefer_for_gemini: z.boolean().default(false),
+
+  /** Use API-key projects as fallback when OAuth Antigravity/Gemini CLI quotas are unavailable. */
+  api_key_fallback: z.boolean().default(true),
+
+  /** Optional pool of Google AI API keys / Cloud projects for Gemini API fallback. */
+  cloud_projects: z.array(AgySdkCloudProjectSchema).default([]),
+});
+export type AgySdkConfig = z.infer<typeof AgySdkConfigSchema>;
+export type AgySdkCloudProject = z.infer<typeof AgySdkCloudProjectSchema>;
+
+export const ModelDiscoveryConfigSchema = z.object({
+  /** Enable runtime model discovery through OpenCode's provider.models hook. */
+  enabled: z.boolean().default(true),
+
+  /** Include public Gemini API models discovered from API keys. */
+  gemini_api: z.boolean().default(true),
+
+  /** Include OAuth-backed Antigravity models discovered from the internal available-models API. */
+  antigravity: z.boolean().default(true),
+});
+export type ModelDiscoveryConfig = z.infer<typeof ModelDiscoveryConfigSchema>;
+
 /**
  * Signature cache configuration for persisting thinking block signatures to disk.
  */
@@ -286,6 +321,33 @@ export const AntigravityConfigSchema = z.object({
    * @default false
    */
   cli_first: z.boolean().default(false),
+
+  /**
+   * Antigravity SDK / Gemini API support.
+   *
+   * Official Antigravity SDK examples use Gemini API keys (`GEMINI_API_KEY`).
+   * These projects are independent from OAuth accounts and can be used as the
+   * new Gemini API path or as fallback capacity when OAuth-backed quotas are exhausted.
+   */
+  agy_sdk: AgySdkConfigSchema.default({
+    enabled: true,
+    prefer_for_gemini: false,
+    api_key_fallback: true,
+    cloud_projects: [],
+  }),
+
+  /**
+   * Runtime model discovery.
+   *
+   * When enabled, OpenCode can populate provider models from available Gemini API
+   * and Antigravity model-list APIs instead of relying only on static config maps.
+   * Static bundled definitions remain the fallback when discovery is unavailable.
+   */
+  model_discovery: ModelDiscoveryConfigSchema.default({
+    enabled: true,
+    gemini_api: true,
+    antigravity: true,
+  }),
   
   /**
    * Strategy for selecting accounts when making requests.
@@ -466,6 +528,17 @@ export const DEFAULT_CONFIG: AntigravityConfig = {
   max_rate_limit_wait_seconds: 300,
   quota_fallback: false,
   cli_first: false,
+  agy_sdk: {
+    enabled: true,
+    prefer_for_gemini: false,
+    api_key_fallback: true,
+    cloud_projects: [],
+  },
+  model_discovery: {
+    enabled: true,
+    gemini_api: true,
+    antigravity: true,
+  },
   account_selection_strategy: 'hybrid',
   pid_offset_enabled: false,
   switch_on_first_rate_limit: true,

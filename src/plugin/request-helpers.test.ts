@@ -1586,7 +1586,7 @@ describe("createSyntheticErrorResponse", () => {
   });
 
   it("generates valid Claude SSE event structure", async () => {
-    const response = createSyntheticErrorResponse("Test", "test-model");
+    const response = createSyntheticErrorResponse("Test", "test-model", "claude");
     const text = await response.text();
     const lines = text.split("\n").filter((l) => l.startsWith("data:"));
 
@@ -1603,7 +1603,7 @@ describe("createSyntheticErrorResponse", () => {
   });
 
   it("includes error message in content_block_delta", async () => {
-    const response = createSyntheticErrorResponse("Something failed", "model");
+    const response = createSyntheticErrorResponse("Something failed", "model", "claude");
     const text = await response.text();
     const lines = text.split("\n").filter((l) => l.startsWith("data:"));
     const events = lines.map((l) => JSON.parse(l.replace("data: ", "")));
@@ -1613,7 +1613,7 @@ describe("createSyntheticErrorResponse", () => {
   });
 
   it("sets end_turn stop reason in message_delta", async () => {
-    const response = createSyntheticErrorResponse("Error", "model");
+    const response = createSyntheticErrorResponse("Error", "model", "claude");
     const text = await response.text();
     const lines = text.split("\n").filter((l) => l.startsWith("data:"));
     const events = lines.map((l) => JSON.parse(l.replace("data: ", "")));

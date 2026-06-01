@@ -19,7 +19,6 @@ import {
 import { defaultSignatureStore } from "./stores/signature-store";
 import {
   DEBUG_MESSAGE_PREFIX,
-  isDebugEnabled,
   isDebugTuiEnabled,
   logAntigravityDebugResponse,
   logCacheStats,
@@ -60,8 +59,6 @@ import {
 import { sanitizeCrossModelPayloadInPlace } from "./transform/cross-model-sanitizer";
 import { isGemini3Model, isImageGenerationModel, buildImageGenerationConfig, applyGeminiTransforms } from "./transform";
 import {
-  resolveModelWithTier,
-  resolveModelWithVariant,
   resolveModelForHeaderStyle,
   resolveAntigravityGemini35FlashBackendModel,
   isClaudeModel,
@@ -109,6 +106,27 @@ function shouldCacheThinkingSignatures(model?: string): boolean {
   // Both Claude and Gemini 3 models require thought signature caching
   // for multi-turn conversations with function calling
   return lower.includes("claude") || lower.includes("gemini-3");
+}
+
+/**
+ * Returns the project component to use in the thinking-signature cache key.
+ *
+ * Gemini 3 thought signatures are content-derived (not project/account-scoped)
+ * and the API only strictly validates function calls in the current turn, so we
+ * keep Gemini-3's signature cache key project-independent. This preserves
+ * reasoning continuity across quota-driven account/project switches: otherwise
+ * the key changes on a switch, the cache misses, the validation-bypass sentinel
+ * is sent instead of the real signature, and the model loses its chain-of-thought
+ * and re-plans the same step forever. Claude keeps project partitioning.
+ */
+function signatureCacheProjectKey(
+  model: string | undefined,
+  projectKey: string | undefined,
+): string | undefined {
+  if (typeof model === "string" && model.toLowerCase().includes("gemini-3")) {
+    return undefined;
+  }
+  return projectKey;
 }
 
 function hashConversationSeed(seed: string): string {
@@ -359,7 +377,13 @@ function isValidRequestPart(part: unknown): boolean {
   );
 }
 
-function sanitizeRequestPayloadForAntigravity(payload: Record<string, unknown>): void {
+function sanitizeRequestPayloadForAntigravity(
+  payload: Record<string, unknown>,
+  restore?: {
+    sessionKey: string;
+    getSignature: (sessionId: string, text: string) => string | undefined;
+  },
+): void {
   const anyPayload = payload as any;
 
   if (Array.isArray(anyPayload.contents)) {
@@ -373,6 +397,30 @@ function sanitizeRequestPayloadForAntigravity(payload: Record<string, unknown>):
         const rawParts = Array.isArray(contentRecord.parts) ? contentRecord.parts : [];
         let foundFirstFunctionCall = false;
 
+        // Gemini 3 multi-turn function calling requires the model's prior
+        // thoughtSignature to be replayed so it can continue its signed
+        // chain-of-thought. When enabled, recover the real signature we cached
+        // from the response (keyed by this block's thinking text) and use it
+        // instead of the validation-bypass sentinel. Without this the model
+        // loses reasoning continuity and re-plans the same step forever.
+        let restoredThoughtSignature: string | undefined;
+        if (restore?.sessionKey) {
+          for (const candidatePart of rawParts) {
+            if (!candidatePart || typeof candidatePart !== "object" || (candidatePart as any).thought !== true) {
+              continue;
+            }
+            const thoughtText = getThinkingPartText(candidatePart);
+            if (!thoughtText) {
+              continue;
+            }
+            const cached = restore.getSignature(restore.sessionKey, thoughtText);
+            if (cached && cached.length >= MIN_SIGNATURE_LENGTH && cached !== SKIP_THOUGHT_SIGNATURE) {
+              restoredThoughtSignature = cached;
+              break;
+            }
+          }
+        }
+
         const sanitizedParts = rawParts.filter(isValidRequestPart).map((part: any) => {
           if (part && typeof part === "object" && part.functionCall) {
             let sig = part.thoughtSignature || part.thought_signature;
@@ -383,7 +431,7 @@ function sanitizeRequestPayloadForAntigravity(payload: Record<string, unknown>):
             if (!foundFirstFunctionCall) {
               foundFirstFunctionCall = true;
               if (!sig || sig.length < MIN_SIGNATURE_LENGTH) {
-                sig = SKIP_THOUGHT_SIGNATURE;
+                sig = restoredThoughtSignature ?? SKIP_THOUGHT_SIGNATURE;
               }
             } else {
               // Parallel function calls MUST NOT have a signature
@@ -751,11 +799,58 @@ function ensureDefaultGemini3ThinkingLevel(
 
 const STREAM_ACTION = "streamGenerateContent";
 
+interface RequestInitWithDuplex extends RequestInit {
+  duplex?: "half";
+}
+
+function mergeRequestHeaders(requestHeaders: Headers | undefined, initHeaders: HeadersInit | undefined): Headers | undefined {
+  if (!requestHeaders && !initHeaders) return undefined;
+  const headers = new Headers(requestHeaders);
+  if (initHeaders) {
+    new Headers(initHeaders).forEach((value, key) => {
+      headers.set(key, value);
+    });
+  }
+  return headers;
+}
+
+function initFromRequest(request: Request | undefined, init: RequestInit | undefined, body?: BodyInit | null): RequestInitWithDuplex {
+  if (!request) return { ...init };
+  const merged: RequestInitWithDuplex = {
+    method: request.method,
+    body: body ?? request.body,
+    signal: request.signal,
+    redirect: request.redirect,
+    credentials: request.credentials,
+    cache: request.cache,
+    referrer: request.referrer,
+    referrerPolicy: request.referrerPolicy,
+    mode: request.mode,
+    integrity: request.integrity,
+    keepalive: request.keepalive,
+    ...init,
+    headers: mergeRequestHeaders(request.headers, init?.headers),
+  };
+  if (merged.body instanceof ReadableStream && merged.duplex === undefined) {
+    merged.duplex = "half";
+  }
+  return merged;
+}
+
 /**
  * Detects requests headed to the Google Generative Language API so we can intercept them.
  */
-export function isGenerativeLanguageRequest(input: RequestInfo): input is string {
-  return typeof input === "string" && input.includes("generativelanguage.googleapis.com");
+export function isGenerativeLanguageRequest(input: RequestInfo): boolean {
+  try {
+    return new URL(requestInfoUrl(input)).hostname === "generativelanguage.googleapis.com";
+  } catch {
+    return false;
+  }
+}
+
+function requestInfoUrl(input: RequestInfo): string {
+  if (typeof input === "string") return input;
+  return input.url || input.toString();
 }
 
 /**
@@ -772,16 +867,7 @@ export interface PrepareRequestOptions {
   fingerprint?: Fingerprint;
 }
 
-export function prepareAntigravityRequest(
-  input: RequestInfo,
-  init: RequestInit | undefined,
-  accessToken: string,
-  projectId: string,
-  endpointOverride?: string,
-  headerStyle: HeaderStyle = "antigravity",
-  forceThinkingRecovery = false,
-  options?: PrepareRequestOptions,
-): {
+interface PreparedAntigravityRequest {
   request: RequestInfo;
   init: RequestInit;
   streaming: boolean;
@@ -796,9 +882,80 @@ export function prepareAntigravityRequest(
   needsSignedThinkingWarmup?: boolean;
   headerStyle: HeaderStyle;
   thinkingRecoveryMessage?: string;
-} {
-  const baseInit: RequestInit = { ...init };
-  const headers = new Headers(init?.headers ?? {});
+}
+
+export function prepareAntigravityRequest(
+  input: string,
+  init: RequestInit | undefined,
+  accessToken: string,
+  projectId: string,
+  endpointOverride?: string,
+  headerStyle?: HeaderStyle,
+  forceThinkingRecovery?: boolean,
+  options?: PrepareRequestOptions,
+): PreparedAntigravityRequest;
+
+export function prepareAntigravityRequest(
+  input: Request,
+  init: RequestInit | undefined,
+  accessToken: string,
+  projectId: string,
+  endpointOverride?: string,
+  headerStyle?: HeaderStyle,
+  forceThinkingRecovery?: boolean,
+  options?: PrepareRequestOptions,
+): PreparedAntigravityRequest | Promise<PreparedAntigravityRequest>;
+
+export function prepareAntigravityRequest(
+  input: RequestInfo,
+  init: RequestInit | undefined,
+  accessToken: string,
+  projectId: string,
+  endpointOverride?: string,
+  headerStyle?: HeaderStyle,
+  forceThinkingRecovery?: boolean,
+  options?: PrepareRequestOptions,
+): PreparedAntigravityRequest | Promise<PreparedAntigravityRequest>;
+
+export function prepareAntigravityRequest(
+  input: RequestInfo,
+  init: RequestInit | undefined,
+  accessToken: string,
+  projectId: string,
+  endpointOverride?: string,
+  headerStyle: HeaderStyle = "antigravity",
+  forceThinkingRecovery = false,
+  options?: PrepareRequestOptions,
+): PreparedAntigravityRequest | Promise<PreparedAntigravityRequest> {
+  if (typeof input !== "string" && init?.body === undefined && input.body) {
+    const requestInput = input;
+    return requestInput.clone().text()
+      .then((body) => prepareAntigravityRequest(
+        requestInput.url,
+        initFromRequest(requestInput, init, body),
+        accessToken,
+        projectId,
+        endpointOverride,
+        headerStyle,
+        forceThinkingRecovery,
+        options,
+      ))
+      .catch(() => prepareAntigravityRequest(
+        requestInput.url,
+        initFromRequest(requestInput, init),
+        accessToken,
+        projectId,
+        endpointOverride,
+        headerStyle,
+        forceThinkingRecovery,
+        options,
+      ));
+  }
+
+  const requestUrl = requestInfoUrl(input);
+  const requestInput = typeof input === "string" ? undefined : input;
+  const baseInit = initFromRequest(requestInput, init);
+  const headers = new Headers(baseInit.headers);
   let resolvedProjectId = projectId?.trim() || "";
   let toolDebugMissing = 0;
   const toolDebugSummaries: string[] = [];
@@ -818,12 +975,13 @@ export function prepareAntigravityRequest(
 
   headers.set("Authorization", `Bearer ${accessToken}`);
   headers.delete("x-api-key");
+  headers.delete("x-goog-api-key");
   // Strip x-goog-user-project header to prevent 403 auth/license conflicts.
   // This header is added by OpenCode/AI SDK and can force project-level checks
   // that are not required for Antigravity/Gemini CLI OAuth requests.
   headers.delete("x-goog-user-project");
 
-  const match = input.match(/\/models\/([^:]+):(\w+)/);
+  const match = requestUrl.match(/\/models\/([^:]+):(\w+)/);
   if (!match) {
     return {
       request: input,
@@ -856,7 +1014,7 @@ export function prepareAntigravityRequest(
     PLUGIN_SESSION_ID,
     effectiveModel,
     undefined,
-    resolveProjectKey(projectId),
+    signatureCacheProjectKey(effectiveModel, resolveProjectKey(projectId)),
   );
 
   let body = baseInit.body;
@@ -920,7 +1078,7 @@ export function prepareAntigravityRequest(
         // Strip tier suffix from model for cache key to prevent cache misses on tier change
         // e.g., "claude-opus-4-6-thinking-high" -> "claude-opus-4-6-thinking"
         const modelForCacheKey = effectiveModel.replace(/-(minimal|low|medium|high)$/i, "");
-        signatureSessionKey = buildSignatureSessionKey(PLUGIN_SESSION_ID, modelForCacheKey, conversationKey, resolveProjectKey(parsedBody.project));
+        signatureSessionKey = buildSignatureSessionKey(PLUGIN_SESSION_ID, modelForCacheKey, conversationKey, signatureCacheProjectKey(modelForCacheKey, resolveProjectKey(parsedBody.project)));
 
         if (requestObjects.length > 0) {
           sessionId = signatureSessionKey;
@@ -1321,7 +1479,9 @@ export function prepareAntigravityRequest(
               };
 
               if (Array.isArray(tool.functionDeclarations) && tool.functionDeclarations.length > 0) {
-                tool.functionDeclarations.forEach((decl: any) => pushDeclaration(decl, "functionDeclarations"));
+                tool.functionDeclarations.forEach((decl: unknown) => {
+                  pushDeclaration(decl, "functionDeclarations");
+                });
                 return;
               }
 
@@ -1385,7 +1545,7 @@ export function prepareAntigravityRequest(
         }
 
         const conversationKey = resolveConversationKey(requestPayload);
-        signatureSessionKey = buildSignatureSessionKey(PLUGIN_SESSION_ID, effectiveModel, conversationKey, resolveProjectKey(projectId));
+        signatureSessionKey = buildSignatureSessionKey(PLUGIN_SESSION_ID, effectiveModel, conversationKey, signatureCacheProjectKey(effectiveModel, resolveProjectKey(projectId)));
 
         // For Claude models, filter out unsigned thinking blocks (required by Claude API)
         // Attempts to restore signatures from cache for multi-turn conversations
@@ -1530,7 +1690,19 @@ export function prepareAntigravityRequest(
         }
 
         stripInjectedDebugFromRequestPayload(requestPayload);
-        sanitizeRequestPayloadForAntigravity(requestPayload);
+        // Gemini 3 caches thought signatures on the response side but, unlike
+        // Claude, had no request-side path to replay them — so restore the
+        // cached signature here. Without it the model loses reasoning
+        // continuity across turns (worsened by quota-driven account switches)
+        // and re-plans the same step forever.
+        const restoreGeminiThoughtSignatures =
+          !isClaude && shouldCacheThinkingSignatures(effectiveModel);
+        sanitizeRequestPayloadForAntigravity(
+          requestPayload,
+          restoreGeminiThoughtSignatures
+            ? { sessionKey: signatureSessionKey, getSignature: getCachedSignature }
+            : undefined,
+        );
 
         const effectiveProjectId = projectId?.trim() || (headerStyle === "antigravity" ? generateSyntheticProjectId() : "");
         resolvedProjectId = effectiveProjectId;
@@ -1775,7 +1947,7 @@ export async function transformAntigravityResponse(
     const text = await response.text();
 
     if (!response.ok) {
-      let errorBody;
+      let errorBody: { error?: { message?: string; details?: Array<Record<string, unknown>> } };
       try {
         errorBody = JSON.parse(text);
       } catch {
@@ -1831,10 +2003,10 @@ export async function transformAntigravityResponse(
 
       if (errorBody?.error?.details && Array.isArray(errorBody.error.details)) {
         const retryInfo = errorBody.error.details.find(
-          (detail: any) => detail['@type'] === 'type.googleapis.com/google.rpc.RetryInfo'
+          (detail) => detail['@type'] === 'type.googleapis.com/google.rpc.RetryInfo'
         );
 
-        if (retryInfo?.retryDelay) {
+        if (typeof retryInfo?.retryDelay === "string") {
           const match = retryInfo.retryDelay.match(/^([\d.]+)s$/);
           if (match && match[1]) {
             const retrySeconds = parseFloat(match[1]);
@@ -1945,6 +2117,8 @@ export const __testExports = {
   hasToolUseInMessages,
   ensureThinkingBeforeToolUseInContents,
   ensureThinkingBeforeToolUseInMessages,
+  sanitizeRequestPayloadForAntigravity,
+  signatureCacheProjectKey,
   generateSyntheticProjectId,
   MIN_SIGNATURE_LENGTH,
   transformSseLine,

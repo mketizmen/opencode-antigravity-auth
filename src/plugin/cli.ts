@@ -19,6 +19,22 @@ export async function promptProjectId(): Promise<string> {
   }
 }
 
+/**
+ * Pause the menu loop so the user can read output that was just printed
+ * before the next menu render clears the screen. No-op when stdin is not a TTY.
+ */
+export async function pressEnterToContinue(
+  message = "Press Enter to return to the menu... ",
+): Promise<void> {
+  if (!input.isTTY) return;
+  const rl = createInterface({ input, output });
+  try {
+    await rl.question(message);
+  } finally {
+    rl.close();
+  }
+}
+
 export async function promptAddAnotherAccount(currentCount: number): Promise<boolean> {
   const rl = createInterface({ input, output });
   try {
@@ -149,6 +165,7 @@ export async function promptLoginMode(existingAccounts: ExistingAccountInfo[]): 
         } else {
           console.log(`\n✗ Failed to configure models: ${result.error}\n`);
         }
+        await pressEnterToContinue();
         continue;
       }
 

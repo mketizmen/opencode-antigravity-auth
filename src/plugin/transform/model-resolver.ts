@@ -364,12 +364,58 @@ function budgetToGemini3Level(budget: number): "low" | "medium" | "high" {
  * - gemini-3-pro-preview (gemini-cli) → gemini-3-pro-low (antigravity)
  * - gemini-3-flash (antigravity) → gemini-3-flash-preview (gemini-cli)
  */
+/**
+ * Maps Antigravity-only bare Gemini ids to the public Gemini API equivalent
+ * served by `generativelanguage.googleapis.com/v1beta`. Verified live against
+ * GET /v1beta/models (May 2026).
+ *
+ * Used by `resolveModelForHeaderStyle(..., "agy-sdk")` so that when OAuth
+ * Antigravity quota is exhausted and the api-key fallback kicks in, requests
+ * for `antigravity-gemini-3.1-pro` (etc.) are rewritten to the public-API
+ * variant Google actually serves — instead of producing a deterministic 404
+ * on the bare id.
+ *
+ * Returns `undefined` when the model is Antigravity-only but has no known
+ * public-API equivalent (e.g. Claude models). Callers should treat that as
+ * "not servable via api-key path" and route accordingly.
+ */
+const ANTIGRAVITY_TO_PUBLIC_API_MODEL_MAP: ReadonlyMap<string, string> = new Map([
+  ["gemini-3-pro", "gemini-3-pro-preview"],
+  ["gemini-3-flash", "gemini-3-flash-preview"],
+  ["gemini-3.1-pro", "gemini-3.1-pro-preview"],
+  ["gemini-3.1-flash", "gemini-3.1-flash-lite"],
+]);
+
+export function mapAntigravityModelToPublicApi(model: string): string | undefined {
+  const stripped = model.toLowerCase().replace(/^antigravity-/, "");
+  // Strip tier suffixes (-minimal/-low/-medium/-high) so
+  // `antigravity-gemini-3.1-pro-high` maps the same as `antigravity-gemini-3.1-pro`.
+  const base = stripped.replace(/-(minimal|low|medium|high)$/, "");
+  return ANTIGRAVITY_TO_PUBLIC_API_MODEL_MAP.get(base);
+}
+
 export function resolveModelForHeaderStyle(
   requestedModel: string,
-  headerStyle: "antigravity" | "gemini-cli",
+  headerStyle: "antigravity" | "gemini-cli" | "agy-sdk",
 ): ResolvedModel {
   const lower = requestedModel.toLowerCase();
   const isGemini3 = lower.includes("gemini-3");
+
+  if (headerStyle === "agy-sdk") {
+    const modelWithTier = requestedModel
+      .replace(/^antigravity-/i, "");
+    const stripped = modelWithTier.replace(/-(minimal|low|medium|high)$/i, "");
+    // Translate Antigravity-only ids (e.g. `gemini-3.1-pro`) to the public Gemini
+    // API equivalent (`gemini-3.1-pro-preview`). Falls back to the bare stripped
+    // name when no translation exists (covers `gemini-3.5-flash`, etc.).
+    const transformedModel = mapAntigravityModelToPublicApi(stripped) ?? stripped;
+    return {
+      ...resolveModelWithTier(modelWithTier),
+      actualModel: transformedModel,
+      quotaPreference: "agy-sdk",
+      explicitQuota: false,
+    };
+  }
 
   if (!isGemini3) {
     return resolveModelWithTier(requestedModel);
@@ -397,7 +443,7 @@ export function resolveModelForHeaderStyle(
   if (headerStyle === "gemini-cli") {
     let transformedModel = requestedModel
       .replace(/^antigravity-/i, "")
-      .replace(/-(low|medium|high)$/i, "");
+      .replace(/-(minimal|low|medium|high)$/i, "");
 
     // Only the legacy 3.0 line takes a "-preview" suffix on the Gemini CLI backend.
     // Dotted-minor generations (gemini-3.1+, gemini-3.5, ...) use bare names there.

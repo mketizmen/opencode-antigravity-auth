@@ -2768,10 +2768,58 @@ export function applyToolPairingFixes(
  * @param requestedModel - The model that was requested
  * @returns A Response object with synthetic SSE stream
  */
+/**
+ * Build a synthetic error response in the Gemini streamGenerateContent SSE shape
+ * (`{ candidates: [...] }`). OpenCode parses Gemini provider responses this way;
+ * returning a Claude-shaped stream for a Gemini request leaves it unparseable
+ * and hangs the request.
+ */
+function createGeminiSyntheticErrorResponse(
+  errorMessage: string,
+  requestedModel: string,
+): Response {
+  const approxTokens = Math.max(1, Math.ceil(errorMessage.length / 4));
+  const chunk = {
+    candidates: [
+      {
+        content: { role: "model", parts: [{ text: errorMessage }] },
+        finishReason: "STOP",
+        index: 0,
+      },
+    ],
+    modelVersion: requestedModel,
+    usageMetadata: {
+      promptTokenCount: 0,
+      candidatesTokenCount: approxTokens,
+      totalTokenCount: approxTokens,
+    },
+  };
+
+  return new Response(`data: ${JSON.stringify(chunk)}\n\n`, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Antigravity-Synthetic": "true",
+    },
+  });
+}
+
 export function createSyntheticErrorResponse(
   errorMessage: string,
   requestedModel: string = "unknown",
+  family?: "gemini" | "claude",
 ): Response {
+  // Match the response shape OpenCode expects for the requested model's family.
+  // Gemini requests must get a Gemini-shaped stream; only Claude requests get
+  // the Anthropic content-block stream below.
+  const isGemini = family === "gemini"
+    || (family === undefined && !requestedModel.toLowerCase().includes("claude"));
+  if (isGemini) {
+    return createGeminiSyntheticErrorResponse(errorMessage, requestedModel);
+  }
+
   // Generate a unique message ID
   const messageId = `msg_synthetic_${Date.now()}`;
   

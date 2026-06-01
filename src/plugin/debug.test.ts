@@ -75,4 +75,25 @@ describe("debug sink policy", () => {
     expect(isDebugTuiEnabled()).toBe(false)
     expect(getLogFilePath()).toContain("antigravity-debug-")
   })
+
+  it("redacts API keys in debug headers and URLs", async () => {
+    const { maskHeadersForLog, sanitizeUrlForLog } = await import("./debug")
+
+    expect(maskHeadersForLog({
+      Authorization: "Bearer secret",
+      "x-api-key": "api-secret",
+      "x-goog-api-key": "goog-secret",
+      "Proxy-Authorization": "Basic proxy-secret",
+      "content-type": "application/json",
+    })).toEqual({
+      authorization: "[redacted]",
+      "x-api-key": "[redacted]",
+      "x-goog-api-key": "[redacted]",
+      "proxy-authorization": "[redacted]",
+      "content-type": "application/json",
+    })
+    expect(sanitizeUrlForLog("https://generativelanguage.googleapis.com/v1beta/models?key=secret&alt=sse")).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/models?key=%5Bredacted%5D&alt=sse",
+    )
+  })
 })

@@ -155,6 +155,80 @@
       "type": "boolean",
       "description": "Prefer gemini-cli routing before Antigravity for Gemini models. When false (default), Antigravity is tried first and gemini-cli is fallback."
     },
+    "agy_sdk": {
+      "default": {
+        "enabled": true,
+        "prefer_for_gemini": false,
+        "api_key_fallback": true,
+        "cloud_projects": []
+      },
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "prefer_for_gemini": {
+          "default": false,
+          "type": "boolean"
+        },
+        "api_key_fallback": {
+          "default": true,
+          "type": "boolean"
+        },
+        "cloud_projects": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "api_key": {
+                "type": "string",
+                "minLength": 1
+              },
+              "project_id": {
+                "type": "string"
+              },
+              "enabled": {
+                "default": true,
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "model_discovery": {
+      "default": {
+        "enabled": true,
+        "gemini_api": true,
+        "antigravity": true
+      },
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "gemini_api": {
+          "default": true,
+          "type": "boolean"
+        },
+        "antigravity": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
     "account_selection_strategy": {
       "default": "hybrid",
       "type": "string",
