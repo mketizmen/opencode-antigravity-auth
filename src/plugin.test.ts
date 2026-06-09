@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { PluginClient } from "./plugin/types";
 
@@ -330,5 +333,317 @@ describe("createAntigravityPlugin auth.loader disk OAuth promotion", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 404-fallback block: when the Antigravity backend returns NOT_FOUND for a
+// model that the public Gemini API can serve, the plugin must route to the
+// api-key path (agy-sdk) instead of returning the raw 404 to the caller.
+// ---------------------------------------------------------------------------
+import { formatRefreshParts } from "./plugin/auth";
+
+describe("createAntigravityPlugin auth.loader 404→agy-sdk fallback", () => {
+  // Isolated XDG_CONFIG_HOME so the real user config file is never loaded.
+  // Without a config file, schema defaults apply: agy_sdk.enabled=true,
+  // agy_sdk.api_key_fallback=true.
+  let tmpConfigHome: string;
+  const savedEnv: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    // Create a fresh, empty temp dir for each test.
+    tmpConfigHome = join(tmpdir(), `opencode-antigravity-test-${process.pid}-${Date.now()}`);
+    mkdirSync(tmpConfigHome, { recursive: true });
+
+    // Save env vars we may touch.
+    savedEnv.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
+    savedEnv.OPENCODE_ANTIGRAVITY_API_KEYS = process.env.OPENCODE_ANTIGRAVITY_API_KEYS;
+    savedEnv.GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    savedEnv.GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+
+    // Point XDG_CONFIG_HOME at the empty temp dir so no real config is read.
+    process.env.XDG_CONFIG_HOME = tmpConfigHome;
+
+    // Reset the storage mock state.
+    vi.mocked(storageModule.loadAccounts).mockReset();
+    vi.mocked(storageModule.saveAccounts).mockReset();
+  });
+
+  afterEach(() => {
+    // Restore saved env vars (undefined means delete).
+    for (const [key, val] of Object.entries(savedEnv)) {
+      if (val === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = val;
+      }
+    }
+    vi.unstubAllGlobals();
+  });
+
+  /**
+   * Build a valid OAuth auth string that makes ensureProjectContext() return
+   * immediately (no network call) by embedding a managedProjectId.
+   */
+  function buildOAuthGetAuth() {
+    const refresh = formatRefreshParts({
+      refreshToken: "r",
+      projectId: "p",
+      managedProjectId: "managed-proj",
+    });
+    const auth = {
+      type: "oauth" as const,
+      refresh,
+      access: "valid-access-token",
+      expires: Date.now() + 3_600_000,
+    };
+    return async () => auth;
+  }
+
+  /**
+   * Build a fetch mock that:
+   * - Returns 404 for ALL Antigravity backend endpoints.
+   * - Returns 200 with SSE body for `generativelanguage.googleapis.com` calls
+   *   that carry an `x-goog-api-key` header (the agy-sdk fallback path).
+   * - Returns `{models:[]}` for model-list GETs to generativelanguage.googleapis.com.
+   * - Returns a token JSON for oauth2.googleapis.com (safety; may not be hit).
+   * - Returns a benign 200 for anything else.
+   */
+  function buildFetchMock({ hasFallbackKey, backendStatus = 404 }: { hasFallbackKey: boolean; backendStatus?: number }) {
+    const SSE_BODY =
+      'data: {"candidates":[{"content":{"parts":[{"text":"hi"}],"role":"model"},"finishReason":"STOP","index":0}]}\n\n';
+
+    return vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : (input as Request).url;
+
+      // Antigravity backend endpoints → return the configured status (default 404).
+      if (
+        url.includes("cloudcode-pa.googleapis.com") ||
+        url.includes("daily-cloudcode-pa") ||
+        url.includes("autopush-cloudcode-pa")
+      ) {
+        const backendBody = backendStatus === 403
+          ? { error: { code: 403, message: "Permission denied.", status: "PERMISSION_DENIED" } }
+          : { error: { code: 404, message: "Requested entity was not found.", status: "NOT_FOUND" } };
+        return new Response(JSON.stringify(backendBody), {
+          status: backendStatus,
+          headers: { "content-type": "application/json" },
+        });
+      }
+
+      // Gemini public API.
+      if (url.includes("generativelanguage.googleapis.com")) {
+        // Model-list GET (no :streamGenerateContent / :generateContent action).
+        if (url.includes("/models") && !url.includes(":")) {
+          return new Response(JSON.stringify({ models: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+
+        // Check for the api-key header — this is what the agy-sdk path injects.
+        let hasApiKey = false;
+        const headersArg = init?.headers ?? (input instanceof Request ? input.headers : undefined);
+        if (headersArg) {
+          if (headersArg instanceof Headers) {
+            hasApiKey = headersArg.has("x-goog-api-key");
+          } else if (typeof headersArg === "object") {
+            hasApiKey = "x-goog-api-key" in (headersArg as Record<string, string>);
+          }
+        }
+
+        if (hasApiKey && hasFallbackKey) {
+          // This is the agy-sdk fallback call — return 200.
+          return new Response(SSE_BODY, {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+
+        // Fallback key not configured or not an api-key call — 200 generic.
+        return new Response(JSON.stringify({ models: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+
+      // Token refresh endpoint (safety net; may not be reached since access token is pre-supplied).
+      if (url.includes("oauth2.googleapis.com")) {
+        return new Response(
+          JSON.stringify({ access_token: "valid-access-token", expires_in: 3600 }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+
+      // Version check / anything else → benign 200.
+      return new Response("1.2.3");
+    });
+  }
+
+  it("falls back to agy-sdk when Antigravity backend returns 404 for a routable Gemini model", async () => {
+    // Provide a fallback key so getAgySdkCredentials() returns a credential.
+    process.env.OPENCODE_ANTIGRAVITY_API_KEYS = "test-fallback-key";
+
+    // Disk holds one usable OAuth account.
+    vi.mocked(storageModule.loadAccounts).mockResolvedValue({
+      version: 4,
+      accounts: [
+        {
+          email: "t@example.com",
+          refreshToken: "r",
+          projectId: "p",
+          addedAt: 0,
+          lastUsed: 0,
+          enabled: true,
+        },
+      ],
+      activeIndex: 0,
+    });
+
+    const fetchMock = buildFetchMock({ hasFallbackKey: true });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plugin = await createAntigravityPlugin("google")({
+      client,
+      directory: process.cwd(),
+    });
+
+    const getAuth = buildOAuthGetAuth();
+    const loader = await plugin.auth.loader(getAuth, {
+      id: "google",
+      api: "https://generativelanguage.googleapis.com/v1beta",
+      npm: "@ai-sdk/google",
+      models: {},
+    });
+
+    // antigravity-gemini-3.5-flash is routable (strips to gemini-3.5-flash which is
+    // a public API model), so isAgySdkSupportedRequest returns true.
+    const requestUrl =
+      "https://generativelanguage.googleapis.com/v1beta/models/antigravity-gemini-3.5-flash:streamGenerateContent?alt=sse";
+
+    const res = await (loader as { fetch: typeof fetch }).fetch(requestUrl, {
+      method: "POST",
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+    });
+
+    // The fallback must succeed and return 200.
+    expect(res.status).toBe(200);
+
+    // Verify that a request to generativelanguage.googleapis.com with an
+    // x-goog-api-key header was made (that's the agy-sdk fallback path).
+    const apiKeyFallbackCalls = fetchMock.mock.calls.filter(([inputArg, initArg]) => {
+      const u = typeof inputArg === "string" ? inputArg : (inputArg as Request).url;
+      if (!u.includes("generativelanguage.googleapis.com")) return false;
+      const hdrs = (initArg as RequestInit | undefined)?.headers;
+      if (!hdrs) return false;
+      if (hdrs instanceof Headers) return hdrs.has("x-goog-api-key");
+      return "x-goog-api-key" in (hdrs as Record<string, string>);
+    });
+    expect(apiKeyFallbackCalls.length).toBeGreaterThan(0);
+  });
+
+  it("returns the 404 Response without throwing when no api-key fallback is configured", async () => {
+    // Ensure NO credentials are available so tryAgySdkFallbackForRequest returns null.
+    delete process.env.OPENCODE_ANTIGRAVITY_API_KEYS;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.GOOGLE_API_KEY;
+
+    // Disk holds one usable OAuth account.
+    vi.mocked(storageModule.loadAccounts).mockResolvedValue({
+      version: 4,
+      accounts: [
+        {
+          email: "t@example.com",
+          refreshToken: "r",
+          projectId: "p",
+          addedAt: 0,
+          lastUsed: 0,
+          enabled: true,
+        },
+      ],
+      activeIndex: 0,
+    });
+
+    const fetchMock = buildFetchMock({ hasFallbackKey: false });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plugin = await createAntigravityPlugin("google")({
+      client,
+      directory: process.cwd(),
+    });
+
+    const getAuth = buildOAuthGetAuth();
+    const loader = await plugin.auth.loader(getAuth, {
+      id: "google",
+      api: "https://generativelanguage.googleapis.com/v1beta",
+      npm: "@ai-sdk/google",
+      models: {},
+    });
+
+    const requestUrl =
+      "https://generativelanguage.googleapis.com/v1beta/models/antigravity-gemini-3.5-flash:streamGenerateContent?alt=sse";
+
+    // Must RESOLVE (not throw) — status 404 because no api-key fallback is available.
+    const res = await (loader as { fetch: typeof fetch }).fetch(requestUrl, {
+      method: "POST",
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+    });
+
+    expect(res.status).toBe(404);
+  });
+
+  it("does NOT fall back to agy-sdk on a 403 from the Antigravity backend (stays on Antigravity)", async () => {
+    // A 403 is a permission/credential signal (expired token, IP/ACL/verification
+    // denial), NOT "model unavailable". Even with a fallback key configured, the
+    // plugin must surface the 403 rather than silently routing to the api-key path —
+    // doing so would mask a real account-access problem and shift the user onto their
+    // API key unknowingly. Only 404 NOT_FOUND triggers the agy-sdk fallback.
+    process.env.OPENCODE_ANTIGRAVITY_API_KEYS = "test-fallback-key";
+
+    vi.mocked(storageModule.loadAccounts).mockResolvedValue({
+      version: 4,
+      accounts: [
+        { email: "t@example.com", refreshToken: "r", projectId: "p", addedAt: 0, lastUsed: 0, enabled: true },
+      ],
+      activeIndex: 0,
+    });
+
+    const fetchMock = buildFetchMock({ hasFallbackKey: true, backendStatus: 403 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plugin = await createAntigravityPlugin("google")({
+      client,
+      directory: process.cwd(),
+    });
+
+    const getAuth = buildOAuthGetAuth();
+    const loader = await plugin.auth.loader(getAuth, {
+      id: "google",
+      api: "https://generativelanguage.googleapis.com/v1beta",
+      npm: "@ai-sdk/google",
+      models: {},
+    });
+
+    const requestUrl =
+      "https://generativelanguage.googleapis.com/v1beta/models/antigravity-gemini-3.5-flash:streamGenerateContent?alt=sse";
+
+    const res = await (loader as { fetch: typeof fetch }).fetch(requestUrl, {
+      method: "POST",
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+    });
+
+    // The backend 403 must be surfaced — NOT replaced by the fallback's 200.
+    expect(res.status).toBe(403);
+
+    // And the agy-sdk fallback must NOT have been invoked (no x-goog-api-key request).
+    const apiKeyFallbackCalls = fetchMock.mock.calls.filter(([inputArg, initArg]) => {
+      const u = typeof inputArg === "string" ? inputArg : (inputArg as Request).url;
+      if (!u.includes("generativelanguage.googleapis.com")) return false;
+      const hdrs = (initArg as RequestInit | undefined)?.headers;
+      if (!hdrs) return false;
+      if (hdrs instanceof Headers) return hdrs.has("x-goog-api-key");
+      return "x-goog-api-key" in (hdrs as Record<string, string>);
+    });
+    expect(apiKeyFallbackCalls.length).toBe(0);
   });
 });
