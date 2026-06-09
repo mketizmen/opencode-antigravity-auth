@@ -336,6 +336,17 @@ async function tryAgySdkFallbackForRequest(
   if (!config.agy_sdk.api_key_fallback || credentials.length === 0 || !isAgySdkSupportedRequest(urlString)) {
     return null;
   }
+  // Defensive: if the original request body was already consumed (e.g. `input` is a
+  // Request whose stream was read upstream), re-sending it through the api-key path
+  // would throw "body already used". Current callers pass a string body, so this is
+  // latent — but bail gracefully (return null → caller surfaces its existing error
+  // Response) rather than letting an unhandled TypeError crash the session.
+  if (typeof input !== "string" && "bodyUsed" in input && (input as Request).bodyUsed) {
+    log.warn("agy-sdk fallback skipped: original request body already consumed", {
+      url: sanitizeUrlForLog(urlString),
+    });
+    return null;
+  }
   return tryFetchWithAgySdkCredentials(
     input,
     init,
@@ -2768,6 +2779,63 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   await logResponseBody(debugContext, response, response.status);
                   lastFailure = createFailureContext(response);
                   continue;
+                }
+
+                // Non-retryable model-availability failure from the Antigravity backend.
+                // A 404 NOT_FOUND means this model isn't served for this account here
+                // (e.g. a Gemini id the Antigravity Code Assist backend doesn't expose) —
+                // retrying other endpoints or accounts can't help, but the public Gemini
+                // API (api-key path) may serve it. Fall back to the agy-sdk SDK/API path
+                // so a model that's unavailable on Antigravity but available via the API
+                // key still succeeds. This mirrors the 429 path, which already falls back.
+                // On fallback failure we LOG and return the (enhanced) error response
+                // instead of throwing, so OpenCode surfaces actionable guidance and the
+                // session/subagent continues.
+                //
+                // We deliberately gate on 404 ONLY, not 403: a 403 from the backend is a
+                // permission/credential signal (expired token, IP/ACL/verification denial),
+                // not "model unavailable". Falling back on 403 would silently mask a real
+                // account-access problem and shift the user onto their API key unknowingly.
+                // The actionable 403 case (account verification) is handled above.
+                if (
+                  response.status === 404 &&
+                  isAgySdkSupportedRequest(urlString)
+                ) {
+                  const fallbackModelLabel = extractRequestedGeminiModel(urlString) ?? model ?? family;
+                  const modelUnavailableFallback = await tryAgySdkFallbackForRequest(
+                    input,
+                    init,
+                    config,
+                    agySdkCredentials,
+                    urlString,
+                  );
+                  if (modelUnavailableFallback) {
+                    if (modelUnavailableFallback.ok) {
+                      pushDebug(`agy-sdk fallback OK after Antigravity ${response.status} for ${fallbackModelLabel}`);
+                      // Expected, healthy degradation — info, not warn.
+                      log.info("agy-sdk fallback served model unavailable on Antigravity", {
+                        antigravityStatus: response.status,
+                        model: fallbackModelLabel,
+                        account: account.email ?? account.index,
+                      });
+                      return modelUnavailableFallback;
+                    }
+                    pushDebug(
+                      `agy-sdk fallback failed (${modelUnavailableFallback.status}) after Antigravity ${response.status} for ${fallbackModelLabel}`,
+                    );
+                    log.warn("agy-sdk fallback also failed for model unavailable on Antigravity", {
+                      antigravityStatus: response.status,
+                      fallbackStatus: modelUnavailableFallback.status,
+                      model: fallbackModelLabel,
+                    });
+                    return modelUnavailableFallback;
+                  }
+                  // No api-key fallback available (disabled or no credentials): fall
+                  // through and return the Antigravity error below. It's still a Response,
+                  // not a throw, so OpenCode continues.
+                  pushDebug(
+                    `no agy-sdk fallback available for ${fallbackModelLabel} after Antigravity ${response.status}`,
+                  );
                 }
 
                 // Success or non-retryable error - return the response
