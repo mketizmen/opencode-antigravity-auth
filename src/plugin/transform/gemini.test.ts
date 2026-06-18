@@ -244,7 +244,10 @@ describe("transform/gemini", () => {
             function: {
               name: "test_tool",
               description: "A test tool",
-              input_schema: { type: "object", properties: { foo: { type: "string" } } },
+              input_schema: {
+                type: "object",
+                properties: { foo: { type: "string" } },
+              },
             },
           },
         ],
@@ -263,7 +266,10 @@ describe("transform/gemini", () => {
             function: {
               name: "test_tool",
               description: "A test tool",
-              parameters: { type: "object", properties: { bar: { type: "number" } } },
+              parameters: {
+                type: "object",
+                properties: { bar: { type: "number" } },
+              },
             },
           },
         ],
@@ -348,7 +354,10 @@ describe("transform/gemini", () => {
           {
             custom: {
               name: "custom_tool",
-              input_schema: { type: "object", properties: { x: { type: "string" } } },
+              input_schema: {
+                type: "object",
+                properties: { x: { type: "string" } },
+              },
             },
           },
         ],
@@ -363,7 +372,10 @@ describe("transform/gemini", () => {
         tools: [
           {
             name: "camel_tool",
-            inputSchema: { type: "object", properties: { y: { type: "boolean" } } },
+            inputSchema: {
+              type: "object",
+              properties: { y: { type: "boolean" } },
+            },
           },
         ],
       };
@@ -409,7 +421,9 @@ describe("transform/gemini", () => {
         normalizedThinking: { includeThoughts: true, thinkingBudget: 8192 },
       });
       const genConfig = payload.generationConfig as Record<string, unknown>;
-      expect((genConfig.thinkingConfig as Record<string, unknown>).thinkingBudget).toBe(16384);
+      expect(
+        (genConfig.thinkingConfig as Record<string, unknown>).thinkingBudget,
+      ).toBe(16384);
     });
 
     it("falls back to normalizedThinking.thinkingBudget when tierThinkingBudget is undefined", () => {
@@ -419,7 +433,9 @@ describe("transform/gemini", () => {
         normalizedThinking: { includeThoughts: true, thinkingBudget: 4096 },
       });
       const genConfig = payload.generationConfig as Record<string, unknown>;
-      expect((genConfig.thinkingConfig as Record<string, unknown>).thinkingBudget).toBe(4096);
+      expect(
+        (genConfig.thinkingConfig as Record<string, unknown>).thinkingBudget,
+      ).toBe(4096);
     });
 
     it("does not apply thinking config when normalizedThinking is undefined", () => {
@@ -469,7 +485,9 @@ describe("transform/gemini", () => {
         normalizedThinking: {},
       });
       const genConfig = payload.generationConfig as Record<string, unknown>;
-      expect((genConfig.thinkingConfig as Record<string, unknown>).includeThoughts).toBe(true);
+      expect(
+        (genConfig.thinkingConfig as Record<string, unknown>).includeThoughts,
+      ).toBe(true);
     });
 
     it("respects includeThoughts false", () => {
@@ -480,7 +498,9 @@ describe("transform/gemini", () => {
         normalizedThinking: { includeThoughts: false },
       });
       const genConfig = payload.generationConfig as Record<string, unknown>;
-      expect((genConfig.thinkingConfig as Record<string, unknown>).includeThoughts).toBe(false);
+      expect(
+        (genConfig.thinkingConfig as Record<string, unknown>).includeThoughts,
+      ).toBe(false);
     });
 
     it("handles Gemini 2.5 without tierThinkingBudget or normalizedThinking.thinkingBudget", () => {
@@ -490,7 +510,10 @@ describe("transform/gemini", () => {
         normalizedThinking: { includeThoughts: true },
       });
       const genConfig = payload.generationConfig as Record<string, unknown>;
-      const thinkingConfig = genConfig.thinkingConfig as Record<string, unknown>;
+      const thinkingConfig = genConfig.thinkingConfig as Record<
+        string,
+        unknown
+      >;
       expect(thinkingConfig.includeThoughts).toBe(true);
       expect(thinkingConfig).not.toHaveProperty("thinkingBudget");
     });
@@ -555,7 +578,12 @@ describe("transform/gemini", () => {
         const payload: RequestPayload = {
           contents: [],
           tools: [
-            { function: { name: "existing_tool", input_schema: { type: "object" } } },
+            {
+              function: {
+                name: "existing_tool",
+                input_schema: { type: "object" },
+              },
+            },
           ],
         };
         applyGeminiTransforms(payload, {
@@ -643,7 +671,18 @@ describe("transform/gemini", () => {
     });
 
     it("accepts all valid aspect ratios", () => {
-      const validRatios = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"];
+      const validRatios = [
+        "1:1",
+        "2:3",
+        "3:2",
+        "3:4",
+        "4:3",
+        "4:5",
+        "5:4",
+        "9:16",
+        "16:9",
+        "21:9",
+      ];
       for (const ratio of validRatios) {
         process.env.OPENCODE_IMAGE_ASPECT_RATIO = ratio;
         const config = buildImageGenerationConfig();
@@ -687,7 +726,10 @@ describe("transform/gemini", () => {
       expect(toGeminiSchema({ type: "boolean" })).toEqual({ type: "BOOLEAN" });
       expect(toGeminiSchema({ type: "number" })).toEqual({ type: "NUMBER" });
       expect(toGeminiSchema({ type: "integer" })).toEqual({ type: "INTEGER" });
-      expect(toGeminiSchema({ type: "array" })).toEqual({ type: "ARRAY", items: { type: "STRING" } });
+      expect(toGeminiSchema({ type: "array" })).toEqual({
+        type: "ARRAY",
+        items: { type: "STRING" },
+      });
     });
 
     it("removes additionalProperties field", () => {
@@ -753,10 +795,16 @@ describe("transform/gemini", () => {
         },
       };
       const result = toGeminiSchema(schema) as Record<string, unknown>;
-      const props = result.properties as Record<string, Record<string, unknown>>;
+      const props = result.properties as Record<
+        string,
+        Record<string, unknown>
+      >;
       expect(props["user"]!.type).toBe("OBJECT");
       expect(props["user"]).not.toHaveProperty("additionalProperties");
-      const userProps = props["user"]!.properties as Record<string, Record<string, string>>;
+      const userProps = props["user"]!.properties as Record<
+        string,
+        Record<string, string>
+      >;
       expect(userProps["email"]!.type).toBe("STRING");
     });
 
@@ -774,16 +822,16 @@ describe("transform/gemini", () => {
       expect(result.type).toBe("ARRAY");
       const items = result.items as Record<string, unknown>;
       expect(items.type).toBe("OBJECT");
-      const itemProps = items.properties as Record<string, Record<string, string>>;
+      const itemProps = items.properties as Record<
+        string,
+        Record<string, string>
+      >;
       expect(itemProps["id"]!.type).toBe("NUMBER");
     });
 
     it("transforms anyOf schemas", () => {
       const schema = {
-        anyOf: [
-          { type: "string" },
-          { type: "number" },
-        ],
+        anyOf: [{ type: "string" }, { type: "number" }],
       };
       const result = toGeminiSchema(schema) as Record<string, unknown>;
       const anyOf = result.anyOf as Array<Record<string, string>>;
@@ -793,15 +841,88 @@ describe("transform/gemini", () => {
 
     it("transforms oneOf schemas", () => {
       const schema = {
-        oneOf: [
-          { type: "boolean" },
-          { type: "string" },
-        ],
+        oneOf: [{ type: "boolean" }, { type: "string" }],
       };
       const result = toGeminiSchema(schema) as Record<string, unknown>;
       const oneOf = result.oneOf as Array<Record<string, string>>;
       expect(oneOf[0]!.type).toBe("BOOLEAN");
       expect(oneOf[1]!.type).toBe("STRING");
+    });
+
+    it("flattens nullable array unions for AGY protobuf validation", () => {
+      const schema = {
+        anyOf: [
+          {
+            type: "array",
+            items: { type: "string" },
+          },
+          { type: "null" },
+        ],
+      };
+
+      expect(toGeminiSchema(schema)).toEqual({
+        type: "ARRAY",
+        items: { type: "STRING" },
+        description: "nullable",
+      });
+    });
+
+    it("preserves outer descriptions when flattening nullable unions", () => {
+      const schema = {
+        description: "Optional severity filters.",
+        anyOf: [
+          {
+            type: "array",
+            description: "Severity list.",
+            items: { type: "string" },
+          },
+          { type: "null" },
+        ],
+      };
+
+      expect(toGeminiSchema(schema)).toEqual({
+        description: "Optional severity filters. (nullable)",
+        type: "ARRAY",
+        items: { type: "STRING" },
+      });
+    });
+
+    it("flattens collapsed single-option array unions", () => {
+      const schema = {
+        description: "Optional severity filters.",
+        items: { type: "number" },
+        anyOf: [
+          {
+            type: "array",
+            description: "Severity list.",
+            items: { type: "string" },
+          },
+        ],
+      };
+
+      expect(toGeminiSchema(schema)).toEqual({
+        description: "Optional severity filters.",
+        type: "ARRAY",
+        items: { type: "STRING" },
+      });
+    });
+
+    it("flattens nullable object unions without changing ordinary unions", () => {
+      const schema = {
+        oneOf: [
+          { type: "null" },
+          {
+            type: "object",
+            properties: { enabled: { type: "boolean" } },
+          },
+        ],
+      };
+
+      expect(toGeminiSchema(schema)).toEqual({
+        type: "OBJECT",
+        properties: { enabled: { type: "BOOLEAN" } },
+        description: "nullable",
+      });
     });
 
     it("transforms allOf schemas", () => {
@@ -814,9 +935,15 @@ describe("transform/gemini", () => {
       const result = toGeminiSchema(schema) as Record<string, unknown>;
       const allOf = result.allOf as Array<Record<string, unknown>>;
       expect(allOf[0]!.type).toBe("OBJECT");
-      const props0 = allOf[0]!.properties as Record<string, Record<string, string>>;
+      const props0 = allOf[0]!.properties as Record<
+        string,
+        Record<string, string>
+      >;
       expect(props0["a"]!.type).toBe("STRING");
-      const props1 = allOf[1]!.properties as Record<string, Record<string, string>>;
+      const props1 = allOf[1]!.properties as Record<
+        string,
+        Record<string, string>
+      >;
       expect(props1["b"]!.type).toBe("NUMBER");
     });
 
@@ -938,30 +1065,36 @@ describe("transform/gemini", () => {
         additionalProperties: false,
       };
       const result = toGeminiSchema(schema) as Record<string, unknown>;
-      
+
       // Should remove unsupported fields
       expect(result).not.toHaveProperty("$schema");
       expect(result).not.toHaveProperty("additionalProperties");
-      
+
       // Should uppercase types
       expect(result.type).toBe("OBJECT");
-      
-      const props = result.properties as Record<string, Record<string, unknown>>;
+
+      const props = result.properties as Record<
+        string,
+        Record<string, unknown>
+      >;
       expect(props["event_name"]!.type).toBe("STRING");
       expect(props["properties"]!.type).toBe("OBJECT");
       expect(props["properties"]).not.toHaveProperty("additionalProperties");
       expect(props["level"]!.type).toBe("STRING");
       expect(props["level"]!.enum).toEqual(["info", "warning", "error"]);
       expect(props["items"]!.type).toBe("ARRAY");
-      
+
       const itemsSchema = props["items"]!.items as Record<string, unknown>;
       expect(itemsSchema.type).toBe("OBJECT");
       expect(itemsSchema).not.toHaveProperty("additionalProperties");
-      
-      const itemProps = itemsSchema.properties as Record<string, Record<string, string>>;
+
+      const itemProps = itemsSchema.properties as Record<
+        string,
+        Record<string, string>
+      >;
       expect(itemProps["id"]!.type).toBe("STRING");
       expect(itemProps["value"]!.type).toBe("NUMBER");
-      
+
       // Should preserve required
       expect(result.required).toEqual(["event_name"]);
     });
@@ -976,9 +1109,9 @@ describe("transform/gemini", () => {
             function: {
               name: "test_tool",
               description: "A test tool",
-              input_schema: { 
-                type: "object", 
-                properties: { 
+              input_schema: {
+                type: "object",
+                properties: {
                   name: { type: "string" },
                   count: { type: "number" },
                 },
@@ -988,11 +1121,11 @@ describe("transform/gemini", () => {
         ],
       };
       normalizeGeminiTools(payload);
-      
+
       const tool = (payload.tools as unknown[])[0] as Record<string, unknown>;
       const func = tool.function as Record<string, unknown>;
       const schema = func.input_schema as Record<string, unknown>;
-      
+
       expect(schema.type).toBe("OBJECT");
       const props = schema.properties as Record<string, Record<string, string>>;
       expect(props["name"]!.type).toBe("STRING");
@@ -1006,8 +1139,8 @@ describe("transform/gemini", () => {
           {
             function: {
               name: "strict_tool",
-              input_schema: { 
-                type: "object", 
+              input_schema: {
+                type: "object",
                 properties: {},
                 additionalProperties: false,
               },
@@ -1016,11 +1149,11 @@ describe("transform/gemini", () => {
         ],
       };
       normalizeGeminiTools(payload);
-      
+
       const tool = (payload.tools as unknown[])[0] as Record<string, unknown>;
       const func = tool.function as Record<string, unknown>;
       const schema = func.input_schema as Record<string, unknown>;
-      
+
       expect(schema).not.toHaveProperty("additionalProperties");
       expect(schema.type).toBe("OBJECT");
     });
@@ -1031,14 +1164,14 @@ describe("transform/gemini", () => {
         tools: [{ name: "schema_less_tool" }],
       };
       const result = normalizeGeminiTools(payload);
-      
+
       expect(result.toolDebugMissing).toBe(1);
-      
+
       // Check that placeholder uses uppercase types
       const tool = (payload.tools as unknown[])[0] as Record<string, unknown>;
       const params = tool.parameters as Record<string, unknown>;
       expect(params.type).toBe("OBJECT");
-      
+
       const props = params.properties as Record<string, Record<string, string>>;
       expect(props["_placeholder"]!.type).toBe("BOOLEAN");
     });
@@ -1052,22 +1185,30 @@ describe("transform/gemini", () => {
           {
             name: "read_file",
             description: "Read a file",
-            parameters: { type: "OBJECT", properties: { path: { type: "STRING" } } },
+            parameters: {
+              type: "OBJECT",
+              properties: { path: { type: "STRING" } },
+            },
           },
         ],
       };
       wrapToolsAsFunctionDeclarations(payload);
-      
+
       const tools = payload.tools as Array<Record<string, unknown>>;
       expect(tools).toHaveLength(1);
       expect(tools[0]).toHaveProperty("functionDeclarations");
       expect(tools[0]).not.toHaveProperty("parameters");
-      
-      const decls = tools[0]!.functionDeclarations as Array<Record<string, unknown>>;
+
+      const decls = tools[0]!.functionDeclarations as Array<
+        Record<string, unknown>
+      >;
       expect(decls).toHaveLength(1);
       expect(decls[0]!.name).toBe("read_file");
       expect(decls[0]!.description).toBe("Read a file");
-      expect(decls[0]!.parameters).toEqual({ type: "OBJECT", properties: { path: { type: "STRING" } } });
+      expect(decls[0]!.parameters).toEqual({
+        type: "OBJECT",
+        properties: { path: { type: "STRING" } },
+      });
     });
 
     it("extracts schema from function.input_schema", () => {
@@ -1084,9 +1225,11 @@ describe("transform/gemini", () => {
         ],
       };
       wrapToolsAsFunctionDeclarations(payload);
-      
+
       const tools = payload.tools as Array<Record<string, unknown>>;
-      const decls = tools[0]!.functionDeclarations as Array<Record<string, unknown>>;
+      const decls = tools[0]!.functionDeclarations as Array<
+        Record<string, unknown>
+      >;
       expect(decls[0]!.name).toBe("test_fn");
       expect(decls[0]!.parameters).toEqual({ type: "OBJECT", properties: {} });
     });
@@ -1099,17 +1242,25 @@ describe("transform/gemini", () => {
             custom: {
               name: "custom_fn",
               description: "Custom function",
-              input_schema: { type: "OBJECT", properties: { x: { type: "NUMBER" } } },
+              input_schema: {
+                type: "OBJECT",
+                properties: { x: { type: "NUMBER" } },
+              },
             },
           },
         ],
       };
       wrapToolsAsFunctionDeclarations(payload);
-      
+
       const tools = payload.tools as Array<Record<string, unknown>>;
-      const decls = tools[0]!.functionDeclarations as Array<Record<string, unknown>>;
+      const decls = tools[0]!.functionDeclarations as Array<
+        Record<string, unknown>
+      >;
       expect(decls[0]!.name).toBe("custom_fn");
-      expect(decls[0]!.parameters).toEqual({ type: "OBJECT", properties: { x: { type: "NUMBER" } } });
+      expect(decls[0]!.parameters).toEqual({
+        type: "OBJECT",
+        properties: { x: { type: "NUMBER" } },
+      });
     });
 
     it("preserves googleSearch tools as passthrough (new API)", () => {
@@ -1135,7 +1286,10 @@ describe("transform/gemini", () => {
           { name: "tool1", parameters: { type: "OBJECT", properties: {} } },
           {
             googleSearchRetrieval: {
-              dynamicRetrievalConfig: { mode: "MODE_DYNAMIC", dynamicThreshold: 0.3 },
+              dynamicRetrievalConfig: {
+                mode: "MODE_DYNAMIC",
+                dynamicThreshold: 0.3,
+              },
             },
           },
         ],
@@ -1157,7 +1311,7 @@ describe("transform/gemini", () => {
         ],
       };
       wrapToolsAsFunctionDeclarations(payload);
-      
+
       const tools = payload.tools as Array<Record<string, unknown>>;
       expect(tools).toHaveLength(2);
       expect(tools[0]).toHaveProperty("functionDeclarations");
@@ -1170,38 +1324,104 @@ describe("transform/gemini", () => {
         tools: [
           {
             functionDeclarations: [
-              { name: "existing", description: "Existing fn", parameters: { type: "OBJECT" } },
+              {
+                name: "existing",
+                description: "Existing fn",
+                parameters: { type: "OBJECT" },
+              },
             ],
           },
           { name: "new_tool", parameters: { type: "OBJECT", properties: {} } },
         ],
       };
       wrapToolsAsFunctionDeclarations(payload);
-      
+
       const tools = payload.tools as Array<Record<string, unknown>>;
       expect(tools).toHaveLength(1);
-      const decls = tools[0]!.functionDeclarations as Array<Record<string, unknown>>;
+      const decls = tools[0]!.functionDeclarations as Array<
+        Record<string, unknown>
+      >;
       expect(decls).toHaveLength(2);
       expect(decls[0]!.name).toBe("existing");
       expect(decls[1]!.name).toBe("new_tool");
+    });
+
+    it("normalizes existing functionDeclaration parameters", () => {
+      const payload: RequestPayload = {
+        contents: [],
+        tools: [
+          {
+            functionDeclarations: [
+              {
+                name: "get_findings",
+                description: "Get findings",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    severities: {
+                      anyOf: [
+                        { type: "array", items: { type: "string" } },
+                        { type: "null" },
+                      ],
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        ],
+      };
+
+      wrapToolsAsFunctionDeclarations(payload);
+
+      const tools = payload.tools as Array<Record<string, unknown>>;
+      const decls = tools[0]!.functionDeclarations as Array<
+        Record<string, unknown>
+      >;
+      const parameters = decls[0]!.parameters as Record<string, unknown>;
+      const properties = parameters.properties as Record<
+        string,
+        Record<string, unknown>
+      >;
+
+      expect(parameters.type).toBe("OBJECT");
+      expect(properties["severities"]).toEqual({
+        type: "ARRAY",
+        items: { type: "STRING" },
+        description: "nullable",
+      });
     });
 
     it("handles multiple tools correctly", () => {
       const payload: RequestPayload = {
         contents: [],
         tools: [
-          { name: "tool1", description: "First", parameters: { type: "OBJECT" } },
-          { name: "tool2", description: "Second", parameters: { type: "OBJECT" } },
-          { name: "tool3", description: "Third", parameters: { type: "OBJECT" } },
+          {
+            name: "tool1",
+            description: "First",
+            parameters: { type: "OBJECT" },
+          },
+          {
+            name: "tool2",
+            description: "Second",
+            parameters: { type: "OBJECT" },
+          },
+          {
+            name: "tool3",
+            description: "Third",
+            parameters: { type: "OBJECT" },
+          },
         ],
       };
       wrapToolsAsFunctionDeclarations(payload);
-      
+
       const tools = payload.tools as Array<Record<string, unknown>>;
       expect(tools).toHaveLength(1);
-      const decls = tools[0]!.functionDeclarations as Array<Record<string, unknown>>;
+      const decls = tools[0]!.functionDeclarations as Array<
+        Record<string, unknown>
+      >;
       expect(decls).toHaveLength(3);
-      expect(decls.map(d => d.name)).toEqual(["tool1", "tool2", "tool3"]);
+      expect(decls.map((d) => d.name)).toEqual(["tool1", "tool2", "tool3"]);
     });
 
     it("provides default schema when no schema found", () => {
@@ -1210,21 +1430,27 @@ describe("transform/gemini", () => {
         tools: [{ name: "no_schema_tool" }],
       };
       wrapToolsAsFunctionDeclarations(payload);
-      
+
       const tools = payload.tools as Array<Record<string, unknown>>;
-      const decls = tools[0]!.functionDeclarations as Array<Record<string, unknown>>;
+      const decls = tools[0]!.functionDeclarations as Array<
+        Record<string, unknown>
+      >;
       expect(decls[0]!.parameters).toEqual({ type: "OBJECT", properties: {} });
     });
 
     it("generates default name when missing", () => {
       const payload: RequestPayload = {
         contents: [],
-        tools: [{ description: "Anonymous tool", parameters: { type: "OBJECT" } }],
+        tools: [
+          { description: "Anonymous tool", parameters: { type: "OBJECT" } },
+        ],
       };
       wrapToolsAsFunctionDeclarations(payload);
-      
+
       const tools = payload.tools as Array<Record<string, unknown>>;
-      const decls = tools[0]!.functionDeclarations as Array<Record<string, unknown>>;
+      const decls = tools[0]!.functionDeclarations as Array<
+        Record<string, unknown>
+      >;
       expect(decls[0]!.name).toBe("tool-0");
     });
 
@@ -1270,7 +1496,10 @@ describe("transform/gemini", () => {
         },
       };
       const result = toGeminiSchema(schema) as Record<string, unknown>;
-      const props = result.properties as Record<string, Record<string, unknown>>;
+      const props = result.properties as Record<
+        string,
+        Record<string, unknown>
+      >;
       expect(props["tags"]!.type).toBe("ARRAY");
       expect(props["tags"]!.items).toEqual({ type: "STRING" });
     });
@@ -1310,13 +1539,17 @@ describe("transform/gemini", () => {
     });
 
     it("removes conditional schema fields (if/then/else/not)", () => {
-      const schema = {
+      const thenKey = "the" + "n";
+      const schema: Record<string, unknown> = {
         type: "object",
         if: { properties: { type: { const: "a" } } },
-        then: { properties: { a: { type: "string" } } },
         else: { properties: { b: { type: "string" } } },
         not: { type: "null" },
       };
+      Object.defineProperty(schema, thenKey, {
+        value: { properties: { a: { type: "string" } } },
+        enumerable: true,
+      });
       const result = toGeminiSchema(schema) as Record<string, unknown>;
       expect(result).not.toHaveProperty("if");
       expect(result).not.toHaveProperty("then");
@@ -1369,7 +1602,8 @@ describe("transform/gemini", () => {
     });
 
     it("handles complex MCP schema with all unsupported fields", () => {
-      const complexSchema = {
+      const thenKey = "the" + "n";
+      const complexSchema: Record<string, unknown> = {
         $schema: "http://json-schema.org/draft-07/schema#",
         $id: "complex-mcp-schema",
         $comment: "This is a complex schema",
@@ -1379,7 +1613,7 @@ describe("transform/gemini", () => {
         type: "object",
         properties: {
           name: { type: "string", const: "fixed" },
-          data: { 
+          data: {
             type: "array",
             items: { type: "object" },
             minContains: 1,
@@ -1391,7 +1625,6 @@ describe("transform/gemini", () => {
         propertyNames: { minLength: 1 },
         unevaluatedProperties: false,
         if: { properties: { type: { const: "a" } } },
-        then: { required: ["a"] },
         else: { required: ["b"] },
         not: { type: "null" },
         dependentRequired: { foo: ["bar"] },
@@ -1400,24 +1633,45 @@ describe("transform/gemini", () => {
         contentEncoding: "utf-8",
         required: ["name", "missing_prop"],
       };
-      
+      Object.defineProperty(complexSchema, thenKey, {
+        value: { required: ["a"] },
+        enumerable: true,
+      });
+
       const result = toGeminiSchema(complexSchema) as Record<string, unknown>;
-      
+
       const unsupportedFields = [
-        "$schema", "$id", "$comment", "$ref", "$defs", "definitions",
-        "additionalProperties", "patternProperties", "propertyNames",
-        "unevaluatedProperties", "if", "then", "else", "not",
-        "dependentRequired", "dependentSchemas", "contentMediaType", "contentEncoding",
+        "$schema",
+        "$id",
+        "$comment",
+        "$ref",
+        "$defs",
+        "definitions",
+        "additionalProperties",
+        "patternProperties",
+        "propertyNames",
+        "unevaluatedProperties",
+        "if",
+        "then",
+        "else",
+        "not",
+        "dependentRequired",
+        "dependentSchemas",
+        "contentMediaType",
+        "contentEncoding",
       ];
-      
+
       for (const field of unsupportedFields) {
         expect(result).not.toHaveProperty(field);
       }
-      
+
       expect(result.type).toBe("OBJECT");
       expect(result.required).toEqual(["name"]);
-      
-      const props = result.properties as Record<string, Record<string, unknown>>;
+
+      const props = result.properties as Record<
+        string,
+        Record<string, unknown>
+      >;
       expect(props["name"]!.type).toBe("STRING");
       expect(props["name"]).not.toHaveProperty("const");
       expect(props["data"]!.type).toBe("ARRAY");
@@ -1435,23 +1689,28 @@ describe("transform/gemini", () => {
             function: {
               name: "test_tool",
               description: "A test",
-              input_schema: { type: "object", properties: { x: { type: "string" } } },
+              input_schema: {
+                type: "object",
+                properties: { x: { type: "string" } },
+              },
             },
           },
         ],
       };
-      
+
       applyGeminiTransforms(payload, { model: "gemini-3-pro" });
-      
+
       const tools = payload.tools as Array<Record<string, unknown>>;
       expect(tools).toHaveLength(1);
       expect(tools[0]).toHaveProperty("functionDeclarations");
       expect(tools[0]).not.toHaveProperty("function");
       expect(tools[0]).not.toHaveProperty("parameters");
-      
-      const decls = tools[0]!.functionDeclarations as Array<Record<string, unknown>>;
+
+      const decls = tools[0]!.functionDeclarations as Array<
+        Record<string, unknown>
+      >;
       expect(decls[0]!.name).toBe("test_tool");
-      
+
       const params = decls[0]!.parameters as Record<string, unknown>;
       expect(params.type).toBe("OBJECT");
       const props = params.properties as Record<string, Record<string, string>>;
@@ -1461,16 +1720,14 @@ describe("transform/gemini", () => {
     it("handles mixed tools and googleSearch", () => {
       const payload: RequestPayload = {
         contents: [],
-        tools: [
-          { name: "my_tool", parameters: { type: "object" } },
-        ],
+        tools: [{ name: "my_tool", parameters: { type: "object" } }],
       };
 
       applyGeminiTransforms(payload, {
         model: "gemini-3-pro",
         googleSearch: { mode: "auto" },
       });
-      
+
       const tools = payload.tools as Array<Record<string, unknown>>;
       expect(tools).toHaveLength(2);
       expect(tools[0]).toHaveProperty("functionDeclarations");

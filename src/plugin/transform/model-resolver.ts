@@ -43,6 +43,8 @@ export const GEMINI_3_THINKING_LEVELS = [
  * - Claude non-thinking: claude-{model} (no -thinking suffix)
  */
 export const MODEL_ALIASES: Record<string, string> = {
+  "gemini-flash-latest": "gemini-3.5-flash",
+
   // Gemini 3 variants - for Gemini CLI only (tier stripped, thinkingLevel used)
   // For Antigravity, these are bypassed and full model name is kept
   "gemini-3-pro-low": "gemini-3-pro",
@@ -68,7 +70,8 @@ const TIER_REGEX = /-(minimal|low|medium|high)$/;
 const QUOTA_PREFIX_REGEX = /^antigravity-/i;
 const GEMINI_3_PRO_REGEX = /^gemini-3(?:\.\d+)?-pro/i;
 const GEMINI_3_FLASH_REGEX = /^gemini-3(?:\.\d+)?-flash/i;
-const GEMINI_35_FLASH_REGEX = /^gemini-3\.5-flash(?:-(minimal|low|medium|high))?$/i;
+const GEMINI_35_FLASH_REGEX =
+  /^gemini-3\.5-flash(?:-(minimal|low|medium|high))?$/i;
 const GEMINI_35_FLASH_LOW_MODEL = "gemini-3.5-flash-low";
 const GEMINI_35_FLASH_HIGH_MODEL = "gemini-3-flash-agent";
 /**
@@ -167,7 +170,9 @@ export function resolveAntigravityGemini35FlashBackendModel(
   }
 
   const level = (thinkingLevel ?? match[1] ?? "low").toLowerCase();
-  return level === "high" ? GEMINI_35_FLASH_HIGH_MODEL : GEMINI_35_FLASH_LOW_MODEL;
+  return level === "high"
+    ? GEMINI_35_FLASH_HIGH_MODEL
+    : GEMINI_35_FLASH_LOW_MODEL;
 }
 
 /**
@@ -230,7 +235,8 @@ export function resolveModelWithTier(
 
   let antigravityModel = modelWithoutQuota;
   if (skipAlias) {
-    const gemini35FlashBackendModel = resolveAntigravityGemini35FlashBackendModel(modelWithoutQuota, tier);
+    const gemini35FlashBackendModel =
+      resolveAntigravityGemini35FlashBackendModel(modelWithoutQuota, tier);
     if (gemini35FlashBackendModel) {
       antigravityModel = gemini35FlashBackendModel;
     } else if (isGemini3Pro && !tier && !isImageModel) {
@@ -379,14 +385,17 @@ function budgetToGemini3Level(budget: number): "low" | "medium" | "high" {
  * public-API equivalent (e.g. Claude models). Callers should treat that as
  * "not servable via api-key path" and route accordingly.
  */
-const ANTIGRAVITY_TO_PUBLIC_API_MODEL_MAP: ReadonlyMap<string, string> = new Map([
-  ["gemini-3-pro", "gemini-3-pro-preview"],
-  ["gemini-3-flash", "gemini-3-flash-preview"],
-  ["gemini-3.1-pro", "gemini-3.1-pro-preview"],
-  ["gemini-3.1-flash", "gemini-3.1-flash-lite"],
-]);
+const ANTIGRAVITY_TO_PUBLIC_API_MODEL_MAP: ReadonlyMap<string, string> =
+  new Map([
+    ["gemini-3-pro", "gemini-3-pro-preview"],
+    ["gemini-3-flash", "gemini-3-flash-preview"],
+    ["gemini-3.1-pro", "gemini-3.1-pro-preview"],
+    ["gemini-3.1-flash", "gemini-3.1-flash-lite"],
+  ]);
 
-export function mapAntigravityModelToPublicApi(model: string): string | undefined {
+export function mapAntigravityModelToPublicApi(
+  model: string,
+): string | undefined {
   const stripped = model.toLowerCase().replace(/^antigravity-/, "");
   // Strip tier suffixes (-minimal/-low/-medium/-high) so
   // `antigravity-gemini-3.1-pro-high` maps the same as `antigravity-gemini-3.1-pro`.
@@ -398,17 +407,22 @@ export function resolveModelForHeaderStyle(
   requestedModel: string,
   headerStyle: "antigravity" | "gemini-cli" | "agy-sdk",
 ): ResolvedModel {
+  const aliasResolvedModel = MODEL_ALIASES[requestedModel];
+  if (aliasResolvedModel) {
+    return resolveModelForHeaderStyle(aliasResolvedModel, headerStyle);
+  }
+
   const lower = requestedModel.toLowerCase();
   const isGemini3 = lower.includes("gemini-3");
 
   if (headerStyle === "agy-sdk") {
-    const modelWithTier = requestedModel
-      .replace(/^antigravity-/i, "");
+    const modelWithTier = requestedModel.replace(/^antigravity-/i, "");
     const stripped = modelWithTier.replace(/-(minimal|low|medium|high)$/i, "");
     // Translate Antigravity-only ids (e.g. `gemini-3.1-pro`) to the public Gemini
     // API equivalent (`gemini-3.1-pro-preview`). Falls back to the bare stripped
     // name when no translation exists (covers `gemini-3.5-flash`, etc.).
-    const transformedModel = mapAntigravityModelToPublicApi(stripped) ?? stripped;
+    const transformedModel =
+      mapAntigravityModelToPublicApi(stripped) ?? stripped;
     return {
       ...resolveModelWithTier(modelWithTier),
       actualModel: transformedModel,
