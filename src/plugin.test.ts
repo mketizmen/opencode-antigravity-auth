@@ -33,11 +33,20 @@ vi.mock("./plugin/storage", async (importOriginal) => {
 
 const { createAntigravityPlugin } = await import("./plugin");
 const storageModule = await import("./plugin/storage");
+const { resetPublicGeminiApiModelCatalogForTests } = await import("./plugin/model-catalog");
 
 const client = {
   tui: { showToast: vi.fn(async () => undefined) },
   app: { log: vi.fn(async () => undefined) },
 } as unknown as PluginClient;
+
+// provider.models() discovery (exercised by some tests below) populates the
+// module-level live model catalog as a side effect. Reset it after every test
+// so one test's (possibly sparse, mock-driven) discovery fetch can't leak
+// into another test's agy-sdk routing assertions.
+afterEach(() => {
+  resetPublicGeminiApiModelCatalogForTests();
+});
 
 describe("createAntigravityPlugin provider models", () => {
   it("returns runtime-shaped discovered models with static fallback", async () => {
@@ -409,7 +418,15 @@ describe("createAntigravityPlugin auth.loader 404→agy-sdk fallback", () => {
    * - Returns a token JSON for oauth2.googleapis.com (safety; may not be hit).
    * - Returns a benign 200 for anything else.
    */
-  function buildFetchMock({ hasFallbackKey, backendStatus = 404 }: { hasFallbackKey: boolean; backendStatus?: number }) {
+  function buildFetchMock({
+    hasFallbackKey,
+    backendStatus = 404,
+    backendMessage,
+  }: {
+    hasFallbackKey: boolean;
+    backendStatus?: number;
+    backendMessage?: string;
+  }) {
     const SSE_BODY =
       'data: {"candidates":[{"content":{"parts":[{"text":"hi"}],"role":"model"},"finishReason":"STOP","index":0}]}\n\n';
 
@@ -423,7 +440,7 @@ describe("createAntigravityPlugin auth.loader 404→agy-sdk fallback", () => {
         url.includes("autopush-cloudcode-pa")
       ) {
         const backendBody = backendStatus === 403
-          ? { error: { code: 403, message: "Permission denied.", status: "PERMISSION_DENIED" } }
+          ? { error: { code: 403, message: backendMessage ?? "Permission denied.", status: "PERMISSION_DENIED" } }
           : { error: { code: 404, message: "Requested entity was not found.", status: "NOT_FOUND" } };
         return new Response(JSON.stringify(backendBody), {
           status: backendStatus,
@@ -592,12 +609,14 @@ describe("createAntigravityPlugin auth.loader 404→agy-sdk fallback", () => {
     expect(res.status).toBe(404);
   });
 
-  it("does NOT fall back to agy-sdk on a 403 from the Antigravity backend (stays on Antigravity)", async () => {
-    // A 403 is a permission/credential signal (expired token, IP/ACL/verification
-    // denial), NOT "model unavailable". Even with a fallback key configured, the
-    // plugin must surface the 403 rather than silently routing to the api-key path —
-    // doing so would mask a real account-access problem and shift the user onto their
-    // API key unknowingly. Only 404 NOT_FOUND triggers the agy-sdk fallback.
+  it("does NOT fall back to agy-sdk on a generic 403 from the Antigravity backend (stays on Antigravity)", async () => {
+    // A generic 403 is a permission/credential signal (expired token, IP/ACL/
+    // verification denial), NOT "model unavailable". Even with a fallback key
+    // configured, the plugin must surface the 403 rather than silently routing
+    // to the api-key path — doing so would mask a real account-access problem
+    // and shift the user onto their API key unknowingly. Only 404 NOT_FOUND and
+    // the specific "permission denied on resource project" 403 (see the test
+    // below) trigger the agy-sdk fallback.
     process.env.OPENCODE_ANTIGRAVITY_API_KEYS = "test-fallback-key";
 
     vi.mocked(storageModule.loadAccounts).mockResolvedValue({
@@ -645,5 +664,65 @@ describe("createAntigravityPlugin auth.loader 404→agy-sdk fallback", () => {
       return "x-goog-api-key" in (hdrs as Record<string, string>);
     });
     expect(apiKeyFallbackCalls.length).toBe(0);
+  });
+
+  it("falls back to agy-sdk on a 403 'permission denied on resource project' from the Antigravity backend", async () => {
+    // Some 403s are a project-scoped entitlement gate on the resolved backend
+    // model id (e.g. a staged Google rollout of a new variant like the Gemini
+    // 3.5 Flash "agent"/high-tier backend) rather than a credential problem.
+    // Retrying other Antigravity endpoints can't help, but the public Gemini
+    // API can still serve the model — so this specific 403 should fall back
+    // just like a 404 does.
+    process.env.OPENCODE_ANTIGRAVITY_API_KEYS = "test-fallback-key";
+
+    vi.mocked(storageModule.loadAccounts).mockResolvedValue({
+      version: 4,
+      accounts: [
+        { email: "t@example.com", refreshToken: "r", projectId: "p", addedAt: 0, lastUsed: 0, enabled: true },
+      ],
+      activeIndex: 0,
+    });
+
+    const fetchMock = buildFetchMock({
+      hasFallbackKey: true,
+      backendStatus: 403,
+      backendMessage: "Permission denied on resource project ata-watch-481914-b3.",
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plugin = await createAntigravityPlugin("google")({
+      client,
+      directory: process.cwd(),
+    });
+
+    const getAuth = buildOAuthGetAuth();
+    const loader = await plugin.auth.loader(getAuth, {
+      id: "google",
+      api: "https://generativelanguage.googleapis.com/v1beta",
+      npm: "@ai-sdk/google",
+      models: {},
+    });
+
+    const requestUrl =
+      "https://generativelanguage.googleapis.com/v1beta/models/antigravity-gemini-3.5-flash:streamGenerateContent?alt=sse";
+
+    const res = await (loader as { fetch: typeof fetch }).fetch(requestUrl, {
+      method: "POST",
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+    });
+
+    // The fallback must succeed and return 200, not the raw 403.
+    expect(res.status).toBe(200);
+
+    // Verify the agy-sdk fallback path (x-goog-api-key header) was used.
+    const apiKeyFallbackCalls = fetchMock.mock.calls.filter(([inputArg, initArg]) => {
+      const u = typeof inputArg === "string" ? inputArg : (inputArg as Request).url;
+      if (!u.includes("generativelanguage.googleapis.com")) return false;
+      const hdrs = (initArg as RequestInit | undefined)?.headers;
+      if (!hdrs) return false;
+      if (hdrs instanceof Headers) return hdrs.has("x-goog-api-key");
+      return "x-goog-api-key" in (hdrs as Record<string, string>);
+    });
+    expect(apiKeyFallbackCalls.length).toBeGreaterThan(0);
   });
 });

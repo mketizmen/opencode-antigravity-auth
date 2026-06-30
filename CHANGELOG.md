@@ -10,6 +10,14 @@
 
 - **Bare Gemini CLI names for 3.1+** - Dotted-minor generations now use bare model names on the Gemini CLI backend (e.g. `gemini-3.1-pro`, `gemini-3.5-flash`) instead of the legacy `-preview` suffix, matching the `agy`/`gemini` CLIs. Renamed the `gemini-3.1-pro-preview` entry to `gemini-3.1-pro`. The 3.0 line (`gemini-3-pro-preview`, `gemini-3-flash-preview`) and the legacy `gemini-3.1-pro-preview-customtools` entry are unchanged, and previously-configured model strings still route via the resolver.
 
+### Fixed
+
+- **403 "Permission denied on resource project" now falls back to agy-sdk** - A 403 on a specific Antigravity backend model id (e.g. the Gemini 3.5 Flash "agent"/high-tier backend `gemini-3-flash-agent`) previously surfaced as a raw error after burning a retry against every Antigravity endpoint (daily/autopush/prod), even with full account quota and a configured agy-sdk fallback key — live testing confirmed the backend id itself is fully available with quota, so this 403 is likely transient or account/project-pairing related rather than a rollout gate. This specific 403 message is now recognized as model-unavailable (distinct from credential/verification 403s, which still surface immediately) and routes to the agy-sdk/API-key path, matching existing 404 behavior, so the request degrades gracefully instead of hard-failing regardless of root cause.
+
+### Changed
+
+- **agy-sdk routing now consults the live public model catalog** - `isAgySdkSupportedRequest`/`isAntigravityOnlyGenerativeLanguageRequest` previously relied solely on a hardcoded `ANTIGRAVITY_ONLY_BARE_GEMINI_IDS` denylist to decide whether a Gemini model can be served by the public API (`generativelanguage.googleapis.com`). That list has repeatedly drifted from reality (multiple competing upstream PRs, since-reverted "speculative model" additions). The plugin now also consults the live model list already fetched for `provider.models()` discovery (`GET v1beta/models`) as an additional positive signal — present in the live catalog is treated as confirmed-routable. Absence from the catalog is never treated as a veto (the live fetch can be incomplete/credential-scoped), so this can only widen what's considered routable, never narrow it.
+
 ## [1.6.0] - 2026-02-20
 
 ### Fixed

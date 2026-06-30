@@ -70,6 +70,7 @@ import {
   modelsFromAntigravityAvailableModels,
   modelsFromGeminiApi,
 } from "./plugin/config/models";
+import { recordPublicGeminiApiModels } from "./plugin/model-catalog";
 import type { AgySdkCredential } from "./plugin/api-key";
 import type {
   AuthDetails,
@@ -195,7 +196,9 @@ async function modelsFromAgySdkCredentials(
   const errors: unknown[] = [];
   for (const credential of credentials) {
     try {
-      return modelsFromGeminiApi(await fetchGeminiApiModels(credential));
+      const models = await fetchGeminiApiModels(credential);
+      recordPublicGeminiApiModels(models);
+      return modelsFromGeminiApi(models);
     } catch (error) {
       errors.push(error);
     }
@@ -666,6 +669,25 @@ function extractVerificationErrorDetails(bodyText: string): {
     message,
     verifyUrl: selectBestVerificationUrl([...verificationUrls]),
   };
+}
+
+/**
+ * Detects a project-scoped "Permission denied on resource project X" 403 from
+ * the Antigravity Code Assist backend (status PERMISSION_DENIED). This is
+ * distinct from `validation_required` (account needs re-verification): it
+ * signals the resolved backend model id isn't entitled for this managed
+ * project — e.g. a staged Google rollout gate on a newly-added backend
+ * variant (such as the Gemini 3.5 Flash "agent"/high-tier id) — not a
+ * credential problem.
+ *
+ * Retrying the other Antigravity endpoints can't help (the project
+ * entitlement is identical across daily/autopush/prod), but the public
+ * Gemini API (agy-sdk path) routes through a separate entitlement system and
+ * can still serve the model.
+ */
+function isModelPermissionDeniedOnProjectError(bodyText: string): boolean {
+  const decoded = decodeEscapedText(bodyText).toLowerCase();
+  return decoded.includes("permission denied on resource project");
 }
 
 async function verifyAccountAccess(
@@ -2739,6 +2761,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 resetRateLimitState(account.index, quotaKey);
                 resetAccountFailureState(account.index);
 
+                let permissionDeniedOnProject = false;
                 if (response.status === 403) {
                   const errorBodyText = await response.clone().text().catch(() => "");
                   const extracted = extractVerificationErrorDetails(errorBodyText);
@@ -2767,10 +2790,16 @@ export const createAntigravityPlugin = (providerId: string) => async (
                     shouldSwitchAccount = true;
                     break;
                   }
+
+                  // Some 403s are not credential/verification problems but a
+                  // project-scoped entitlement gate on this specific backend
+                  // model id (e.g. a staged rollout of a new variant). See
+                  // isModelPermissionDeniedOnProjectError for details.
+                  permissionDeniedOnProject = isModelPermissionDeniedOnProjectError(errorBodyText);
                 }
 
                 const shouldRetryEndpoint = (
-                  response.status === 403 ||
+                  (response.status === 403 && !permissionDeniedOnProject) ||
                   response.status === 404 ||
                   response.status >= 500
                 );
@@ -2783,22 +2812,27 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
                 // Non-retryable model-availability failure from the Antigravity backend.
                 // A 404 NOT_FOUND means this model isn't served for this account here
-                // (e.g. a Gemini id the Antigravity Code Assist backend doesn't expose) —
-                // retrying other endpoints or accounts can't help, but the public Gemini
-                // API (api-key path) may serve it. Fall back to the agy-sdk SDK/API path
-                // so a model that's unavailable on Antigravity but available via the API
-                // key still succeeds. This mirrors the 429 path, which already falls back.
+                // (e.g. a Gemini id the Antigravity Code Assist backend doesn't expose).
+                // A 403 PERMISSION_DENIED with "Permission denied on resource project"
+                // means the resolved backend model id isn't entitled for this managed
+                // project (e.g. a staged Google rollout gate) — same practical effect as
+                // a 404 from the caller's perspective. In both cases retrying other
+                // endpoints or accounts can't help, but the public Gemini API (api-key
+                // path) may serve it. Fall back to the agy-sdk SDK/API path so a model
+                // that's unavailable on Antigravity but available via the API key still
+                // succeeds. This mirrors the 429 path, which already falls back.
                 // On fallback failure we LOG and return the (enhanced) error response
                 // instead of throwing, so OpenCode surfaces actionable guidance and the
                 // session/subagent continues.
                 //
-                // We deliberately gate on 404 ONLY, not 403: a 403 from the backend is a
-                // permission/credential signal (expired token, IP/ACL/verification denial),
-                // not "model unavailable". Falling back on 403 would silently mask a real
-                // account-access problem and shift the user onto their API key unknowingly.
-                // The actionable 403 case (account verification) is handled above.
+                // We deliberately do NOT fall back on other 403s: a generic 403 from the
+                // backend is a permission/credential signal (expired token, IP/ACL/
+                // verification denial), not "model unavailable". Falling back there would
+                // silently mask a real account-access problem and shift the user onto
+                // their API key unknowingly. The actionable 403 case (account
+                // verification) is handled above.
                 if (
-                  response.status === 404 &&
+                  (response.status === 404 || permissionDeniedOnProject) &&
                   isAgySdkSupportedRequest(urlString)
                 ) {
                   const fallbackModelLabel = extractRequestedGeminiModel(urlString) ?? model ?? family;

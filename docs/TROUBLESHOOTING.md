@@ -63,6 +63,26 @@ Remove-Item "$env:USERPROFILE\.bun\install\cache\opencode-antigravity-auth*" -Re
 opencode auth login
 ```
 
+### Behavior doesn't match the version you just installed/built
+
+If you just updated, switched branches, or ran `npm run build` locally and OpenCode still
+behaves like the old code (including errors that look server-side, like an unexpected 403/404
+on a model that otherwise works fine), OpenCode is very likely still running a stale cached
+copy of the plugin rather than the one you just built.
+
+**macOS/Linux:**
+```bash
+rm -rf ~/.cache/opencode/packages/opencode-antigravity-auth@latest
+```
+
+**Windows (PowerShell):**
+```powershell
+Remove-Item "$env:LOCALAPPDATA\opencode\Cache\packages\opencode-antigravity-auth@latest" -Recurse -Force -ErrorAction SilentlyContinue
+```
+
+This is a different cache path than the `node_modules`/`.bun` ones cleared in the "no longer
+supported" fix below — clear both if you're not sure which one is stale.
+
 ### "Model not found"
 Add this to your `google` provider config:
 ```json

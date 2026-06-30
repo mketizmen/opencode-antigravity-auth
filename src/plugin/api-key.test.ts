@@ -15,6 +15,7 @@ import {
   resetAgySdkCredentialStateForTests,
 } from "./api-key";
 import { DEFAULT_CONFIG, type AntigravityConfig } from "./config";
+import { recordPublicGeminiApiModels, resetPublicGeminiApiModelCatalogForTests } from "./model-catalog";
 
 function withConfig(overrides: Partial<AntigravityConfig>): AntigravityConfig {
   return {
@@ -35,6 +36,7 @@ async function readPreparedBody(body: BodyInit | null | undefined): Promise<unkn
 describe("api-key agy sdk support", () => {
   beforeEach(() => {
     resetAgySdkCredentialStateForTests();
+    resetPublicGeminiApiModelCatalogForTests();
   });
 
   it("loads API key credentials from auth, config cloud projects, and environment", () => {
@@ -279,6 +281,33 @@ describe("api-key agy sdk support", () => {
     expect(isAntigravityOnlyGenerativeLanguageRequest("https://example.com/v1beta/models/claude-opus-4-6-thinking:generateContent")).toBe(false);
     expect(isAntigravityOnlyGenerativeLanguageRequest("not a url")).toBe(false);
     expect(isAntigravityOnlyGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1beta/models")).toBe(false);
+  });
+
+  it("uses the live public model catalog as an additional positive signal, never a veto", () => {
+    // Cold start (no catalog recorded yet): falls back to the static
+    // ANTIGRAVITY_ONLY_BARE_GEMINI_IDS heuristic, which assumes any
+    // non-denylisted bare id is public-API native.
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent")).toBe(true);
+
+    // A live catalog fetch can be incomplete (credential-scoped, a partial
+    // page, briefly stale) — simulate that by recording a sparse list that
+    // omits gemini-3-flash, which IS denylisted statically (Antigravity-only,
+    // no public translation) and would 404 if actually routed there.
+    recordPublicGeminiApiModels([
+      { name: "models/gemini-3.5-flash", supportedGenerationMethods: ["generateContent"] },
+    ]);
+
+    // Present in the live catalog → confirmed routable.
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent")).toBe(true);
+
+    // Absent from the (possibly-incomplete) live catalog must NOT flip an
+    // otherwise-allowed static-heuristic case to rejected.
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-9-made-up:generateContent")).toBe(true);
+
+    // Explicit translations (e.g. gemini-3.1-pro → gemini-3.1-pro-preview) still
+    // take priority over the catalog, even though the bare backend id itself
+    // isn't in the public list.
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:generateContent")).toBe(true);
   });
 
   it("extractRequestedGeminiModel pulls the model id from a generativelanguage URL", () => {

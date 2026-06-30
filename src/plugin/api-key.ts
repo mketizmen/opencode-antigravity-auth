@@ -1,5 +1,6 @@
 import { extractVariantThinkingConfig } from "./request-helpers";
 import { applyGeminiTransforms, isGemini3Model, mapAntigravityModelToPublicApi, resolveModelForHeaderStyle } from "./transform";
+import { getPublicGeminiApiModelIds } from "./model-catalog";
 import type { AntigravityConfig } from "./config";
 import type { GeminiApiModel } from "./config/models";
 import type { ApiKeyAuthDetails } from "./types";
@@ -141,9 +142,16 @@ export function isApiKeyAuth(auth: unknown): auth is ApiKeyAuthDetails {
  *  - Claude models: never servable on the public API → returns false.
  *  - Has an explicit translation (e.g. `gemini-3.1-pro` → `gemini-3.1-pro-preview`)
  *    via `mapAntigravityModelToPublicApi` → routable.
- *  - Stripped id is NOT in the Antigravity-only denylist → assumed public-API
- *    native (covers `antigravity-gemini-3.5-flash` → `gemini-3.5-flash`, which
- *    the public API serves bare).
+ *  - Present in the live public model catalog (`GET v1beta/models`, cached from
+ *    the `provider.models()` discovery fetch), when available → routable. This
+ *    is checked as an ADDITIONAL positive signal only, never a veto: the live
+ *    fetch can be incomplete (credential-scoped, a partial page, briefly stale
+ *    after Google adds a model) and this whole path exists as a permissive
+ *    last-resort fallback, so absence from a possibly-incomplete live snapshot
+ *    must never override an otherwise-allowed static heuristic below.
+ *  - Otherwise: stripped id NOT in the Antigravity-only denylist → assumed
+ *    public-API native (covers `antigravity-gemini-3.5-flash` → `gemini-3.5-flash`,
+ *    which the public API serves bare).
  *
  * Shared by `isAgySdkSupportedRequest` (positive gate) and
  * `isAntigravityOnlyGenerativeLanguageRequest` (negative gate / synthetic-404 trigger).
@@ -156,6 +164,10 @@ function canRouteAsPublicGeminiApiModel(model: string): boolean {
 
   // Explicit translation (e.g. gemini-3.1-pro → gemini-3.1-pro-preview) → routable.
   if (mapAntigravityModelToPublicApi(stripped)) return true;
+
+  // Live ground truth confirms routability when present, but its absence is
+  // never treated as evidence of non-routability (see docstring above).
+  if (getPublicGeminiApiModelIds()?.has(stripped)) return true;
 
   // For `antigravity-` prefixed inputs without a known mapping, require the
   // stripped id to look like a Gemini-family id. Unknown antigravity-* ids
