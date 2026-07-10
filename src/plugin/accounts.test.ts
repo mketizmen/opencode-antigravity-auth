@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { AccountManager, type ModelFamily, type HeaderStyle, parseRateLimitReason, calculateBackoffMs, type RateLimitReason, resolveQuotaGroup } from "./accounts";
+import { AccountManager, type ModelFamily, parseRateLimitReason, calculateBackoffMs, resolveQuotaGroup } from "./accounts";
 import type { AccountStorageV4 } from "./storage";
 import type { OAuthAuthDetails } from "./types";
+import * as storageModule from "./storage";
 
 // Mock storage to prevent test data from leaking to real config files
 vi.mock("./storage", async (importOriginal) => {
@@ -11,6 +12,7 @@ vi.mock("./storage", async (importOriginal) => {
     ...original,
     saveAccounts: vi.fn().mockResolvedValue(undefined),
     saveAccountsReplace: vi.fn().mockResolvedValue(undefined),
+    removeAccountFromStorage: vi.fn().mockResolvedValue(undefined),
   };
 });
 
@@ -1173,6 +1175,35 @@ describe("AccountManager", () => {
 
       saveSpy.mockRestore();
     });
+
+    it("waits for an in-flight save before persisting a revoked-account removal", async () => {
+      const staleSave = Promise.withResolvers<void>();
+      vi.mocked(storageModule.saveAccounts).mockImplementationOnce(async () => staleSave.promise);
+      vi.mocked(storageModule.removeAccountFromStorage).mockClear();
+      const stored: AccountStorageV4 = {
+        version: 4,
+        accounts: [
+          { refreshToken: "revoked", projectId: "p1", addedAt: 1, lastUsed: 0 },
+          { refreshToken: "valid", projectId: "p2", addedAt: 2, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      };
+      const manager = new AccountManager(undefined, stored);
+      const account = manager.getAccounts()[0];
+      if (!account) throw new Error("Revoked account not found");
+
+      const inFlightSave = manager.saveToDisk();
+      await vi.waitFor(() => expect(storageModule.saveAccounts).toHaveBeenCalledOnce());
+      manager.removeAccount(account);
+      const removal = manager.persistAccountRemoval("revoked");
+      await Promise.resolve();
+
+      expect(storageModule.removeAccountFromStorage).not.toHaveBeenCalled();
+      staleSave.resolve();
+      await inFlightSave;
+      await removal;
+      expect(storageModule.removeAccountFromStorage).toHaveBeenCalledWith("revoked");
+    });
   });
 
   describe("Rate Limit Reason Classification", () => {
@@ -1614,6 +1645,54 @@ describe("AccountManager", () => {
       expect(account?.parts.refreshToken).toBe("r2");
     });
 
+    it("allows gemini-cli selection when only Antigravity quota is exhausted", () => {
+      const stored: AccountStorageV4 = {
+        version: 4,
+        accounts: [
+          { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      };
+      const manager = new AccountManager(undefined, stored);
+      manager.updateQuotaCache(0, { "gemini-pro": { remainingFraction: 0, modelCount: 1 } });
+
+      const account = manager.getCurrentOrNextForFamily(
+        "gemini",
+        "gemini-2.5-pro",
+        "sticky",
+        "gemini-cli",
+        false,
+        90,
+      );
+
+      expect(account?.parts.refreshToken).toBe("r1");
+    });
+
+    it("fails open for a cached quota whose reset time has elapsed", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-01-28T16:00:00Z"));
+      const stored: AccountStorageV4 = {
+        version: 4,
+        accounts: [
+          { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      };
+      const manager = new AccountManager(undefined, stored);
+      manager.updateQuotaCache(0, {
+        claude: {
+          remainingFraction: 0.05,
+          resetTime: "2026-01-28T15:00:00Z",
+          modelCount: 1,
+        },
+      });
+
+      const account = manager.getCurrentOrNextForFamily("claude", null, "sticky", "antigravity", false, 90);
+
+      expect(account?.parts.refreshToken).toBe("r1");
+      vi.useRealTimers();
+    });
+
     it("allows account under soft quota threshold", () => {
       const stored: AccountStorageV4 = {
         version: 4,
@@ -1833,7 +1912,7 @@ describe("AccountManager", () => {
       vi.useRealTimers();
     });
 
-    it("returns null (fail-open) when resetTime is in the past", () => {
+    it("returns 0 when resetTime is in the past because the account is available", () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date("2026-01-28T16:00:00Z"));
 
@@ -1855,7 +1934,7 @@ describe("AccountManager", () => {
       });
 
       const waitMs = manager.getMinWaitTimeForSoftQuota("claude", 90, 10 * 60 * 1000);
-      expect(waitMs).toBe(null);
+      expect(waitMs).toBe(0);
 
       vi.useRealTimers();
     });

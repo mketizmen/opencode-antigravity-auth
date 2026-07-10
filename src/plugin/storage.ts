@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import lockfile from "proper-lockfile";
 import type { HeaderStyle } from "../constants";
 import { createLogger } from "./logger";
@@ -218,6 +218,7 @@ export interface AccountStorageV4 {
   version: 4;
   accounts: AccountMetadataV3[];
   activeIndex: number;
+  deletedRefreshTokenHashes?: string[];
   activeIndexByFamily?: {
     claude?: number;
     gemini?: number;
@@ -404,15 +405,19 @@ function mergeAccountStorage(
   incoming: AccountStorageV4,
 ): AccountStorageV4 {
   const accountMap = new Map<string, AccountMetadataV3>();
+  const deletedRefreshTokenHashes = new Set([
+    ...(existing.deletedRefreshTokenHashes ?? []),
+    ...(incoming.deletedRefreshTokenHashes ?? []),
+  ]);
 
   for (const acc of existing.accounts) {
-    if (acc.refreshToken) {
+    if (acc.refreshToken && !deletedRefreshTokenHashes.has(hashRefreshToken(acc.refreshToken))) {
       accountMap.set(acc.refreshToken, acc);
     }
   }
 
   for (const acc of incoming.accounts) {
-    if (acc.refreshToken) {
+    if (acc.refreshToken && !deletedRefreshTokenHashes.has(hashRefreshToken(acc.refreshToken))) {
       const existingAcc = accountMap.get(acc.refreshToken);
       if (existingAcc) {
         accountMap.set(acc.refreshToken, {
@@ -433,12 +438,24 @@ function mergeAccountStorage(
     }
   }
 
+  const accounts = Array.from(accountMap.values());
   return {
     version: 4,
-    accounts: Array.from(accountMap.values()),
-    activeIndex: incoming.activeIndex,
-    activeIndexByFamily: incoming.activeIndexByFamily,
+    accounts,
+    activeIndex: remapActiveIndex(incoming.accounts, accounts, incoming.activeIndex),
+    activeIndexByFamily: remapActiveIndexByFamily(
+      incoming.activeIndexByFamily,
+      incoming.accounts,
+      accounts,
+    ),
+    deletedRefreshTokenHashes: deletedRefreshTokenHashes.size > 0
+      ? Array.from(deletedRefreshTokenHashes)
+      : undefined,
   };
+}
+
+function hashRefreshToken(refreshToken: string): string {
+  return createHash("sha256").update(refreshToken).digest("hex");
 }
 
 export function deduplicateAccountsByEmail<
@@ -504,6 +521,72 @@ export function deduplicateAccountsByEmail<
   }
 
   return result;
+}
+
+function accountIdentity(account: AccountMetadataV3): string {
+  return account.email
+    ? `email:${account.email}`
+    : `refreshToken:${account.refreshToken}`;
+}
+
+function clampActiveIndex(activeIndex: number, accountCount: number): number {
+  if (accountCount === 0) {
+    return 0;
+  }
+
+  const index = Number.isFinite(activeIndex) ? activeIndex : 0;
+  return Math.max(0, Math.min(index, accountCount - 1));
+}
+
+function remapActiveIndex(
+  accounts: AccountMetadataV3[],
+  deduplicatedAccounts: AccountMetadataV3[],
+  activeIndex: number,
+): number {
+  const fallbackIndex = clampActiveIndex(activeIndex, deduplicatedAccounts.length);
+  const selectedAccount = accounts[activeIndex];
+
+  if (!selectedAccount) {
+    return fallbackIndex;
+  }
+
+  const selectedIdentity = accountIdentity(selectedAccount);
+  const remappedIndex = deduplicatedAccounts.findIndex(
+    (account) => accountIdentity(account) === selectedIdentity,
+  );
+
+  return remappedIndex === -1 ? fallbackIndex : remappedIndex;
+}
+
+function remapActiveIndexByFamily(
+  activeIndexByFamily: AccountStorageV4["activeIndexByFamily"],
+  accounts: AccountMetadataV3[],
+  deduplicatedAccounts: AccountMetadataV3[],
+): AccountStorageV4["activeIndexByFamily"] {
+  if (!activeIndexByFamily) {
+    return undefined;
+  }
+
+  return {
+    ...(activeIndexByFamily.claude === undefined
+      ? {}
+      : {
+          claude: remapActiveIndex(
+            accounts,
+            deduplicatedAccounts,
+            activeIndexByFamily.claude,
+          ),
+        }),
+    ...(activeIndexByFamily.gemini === undefined
+      ? {}
+      : {
+          gemini: remapActiveIndex(
+            accounts,
+            deduplicatedAccounts,
+            activeIndexByFamily.gemini,
+          ),
+        }),
+  };
 }
 
 function migrateV1ToV2(v1: AccountStorageV1): AccountStorage {
@@ -648,12 +731,16 @@ export async function loadAccounts(): Promise<AccountStorageV4 | null> {
     }
 
     // Validate accounts have required fields
+    const deletedRefreshTokenHashes = new Set(
+      (storage.deletedRefreshTokenHashes ?? []).filter((hash): hash is string => typeof hash === "string"),
+    );
     const validAccounts = storage.accounts.filter(
       (a): a is AccountMetadataV3 => {
         return (
           !!a &&
           typeof a === "object" &&
-          typeof (a as AccountMetadataV3).refreshToken === "string"
+          typeof (a as AccountMetadataV3).refreshToken === "string" &&
+          !deletedRefreshTokenHashes.has(hashRefreshToken((a as AccountMetadataV3).refreshToken))
         );
       },
     );
@@ -661,24 +748,24 @@ export async function loadAccounts(): Promise<AccountStorageV4 | null> {
     // Deduplicate accounts by email (keeps newest entry for each email)
     const deduplicatedAccounts = deduplicateAccountsByEmail(validAccounts);
 
-    // Clamp activeIndex to valid range after deduplication
-    let activeIndex =
-      typeof storage.activeIndex === "number" &&
-      Number.isFinite(storage.activeIndex)
-        ? storage.activeIndex
-        : 0;
-    if (deduplicatedAccounts.length > 0) {
-      activeIndex = Math.min(activeIndex, deduplicatedAccounts.length - 1);
-      activeIndex = Math.max(activeIndex, 0);
-    } else {
-      activeIndex = 0;
-    }
+    const activeIndex = remapActiveIndex(
+      validAccounts,
+      deduplicatedAccounts,
+      storage.activeIndex,
+    );
 
     return {
       version: 4,
       accounts: deduplicatedAccounts,
       activeIndex,
-      activeIndexByFamily: storage.activeIndexByFamily,
+      deletedRefreshTokenHashes: deletedRefreshTokenHashes.size > 0
+        ? Array.from(deletedRefreshTokenHashes)
+        : undefined,
+      activeIndexByFamily: remapActiveIndexByFamily(
+        storage.activeIndexByFamily,
+        validAccounts,
+        deduplicatedAccounts,
+      ),
     };
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -699,22 +786,7 @@ export async function saveAccounts(storage: AccountStorageV4): Promise<void> {
   await withFileLock(path, async () => {
     const existing = await loadAccountsUnsafe();
     const merged = existing ? mergeAccountStorage(existing, storage) : storage;
-
-    const tempPath = `${path}.${randomBytes(6).toString("hex")}.tmp`;
-    const content = JSON.stringify(merged, null, 2);
-
-    try {
-      await fs.writeFile(tempPath, content, { encoding: "utf-8", mode: 0o600 });
-      await fs.rename(tempPath, path);
-    } catch (error) {
-      // Clean up temp file on failure to prevent accumulation
-      try {
-        await fs.unlink(tempPath);
-      } catch {
-        // Ignore cleanup errors (file may not exist)
-      }
-      throw error;
-    }
+    await writeAccountsAtomically(path, merged);
   });
 }
 
@@ -730,21 +802,65 @@ export async function saveAccountsReplace(storage: AccountStorageV4): Promise<vo
   await ensureGitignore(configDir);
 
   await withFileLock(path, async () => {
-    const tempPath = `${path}.${randomBytes(6).toString("hex")}.tmp`;
-    const content = JSON.stringify(storage, null, 2);
-
-    try {
-      await fs.writeFile(tempPath, content, { encoding: "utf-8", mode: 0o600 });
-      await fs.rename(tempPath, path);
-    } catch (error) {
-      try {
-        await fs.unlink(tempPath);
-      } catch {
-        // Ignore cleanup errors
-      }
-      throw error;
-    }
+    const existing = await loadAccountsUnsafe();
+    const deletedRefreshTokenHashes = new Set([
+      ...(existing?.deletedRefreshTokenHashes ?? []),
+      ...(storage.deletedRefreshTokenHashes ?? []),
+    ]);
+    await writeAccountsAtomically(path, {
+      ...storage,
+      accounts: storage.accounts.filter(
+        (account) => !deletedRefreshTokenHashes.has(hashRefreshToken(account.refreshToken)),
+      ),
+      deletedRefreshTokenHashes: deletedRefreshTokenHashes.size > 0
+        ? Array.from(deletedRefreshTokenHashes)
+        : undefined,
+    });
   });
+}
+
+export async function removeAccountFromStorage(refreshToken: string): Promise<void> {
+  const path = getStoragePath();
+  const configDir = dirname(path);
+  await fs.mkdir(configDir, { recursive: true });
+  await ensureGitignore(configDir);
+
+  await withFileLock(path, async () => {
+    const existing = await loadAccountsUnsafe();
+    if (!existing) return;
+    const accounts = existing.accounts.filter((account) => account.refreshToken !== refreshToken);
+    const deletedRefreshTokenHashes = new Set(existing.deletedRefreshTokenHashes ?? []);
+    deletedRefreshTokenHashes.add(hashRefreshToken(refreshToken));
+
+    await writeAccountsAtomically(path, {
+      version: 4,
+      accounts,
+      activeIndex: remapActiveIndex(existing.accounts, accounts, existing.activeIndex),
+      deletedRefreshTokenHashes: Array.from(deletedRefreshTokenHashes),
+      activeIndexByFamily: remapActiveIndexByFamily(
+        existing.activeIndexByFamily,
+        existing.accounts,
+        accounts,
+      ),
+    });
+  });
+}
+
+async function writeAccountsAtomically(path: string, storage: AccountStorageV4): Promise<void> {
+  const tempPath = `${path}.${randomBytes(6).toString("hex")}.tmp`;
+  const content = JSON.stringify(storage, null, 2);
+
+  try {
+    await fs.writeFile(tempPath, content, { encoding: "utf-8", mode: 0o600 });
+    await fs.rename(tempPath, path);
+  } catch (error) {
+    try {
+      await fs.unlink(tempPath);
+    } catch {
+      // Ignore cleanup errors because the temporary file may not exist.
+    }
+    throw error;
+  }
 }
 
 async function loadAccountsUnsafe(): Promise<AccountStorageV4 | null> {
@@ -754,22 +870,25 @@ async function loadAccountsUnsafe(): Promise<AccountStorageV4 | null> {
     await ensureSecurePermissions(path);
 
     const content = await fs.readFile(path, "utf-8");
-    const parsed = JSON.parse(content);
+    const parsed = JSON.parse(content) as AnyAccountStorage;
 
     if (parsed.version === 1) {
-      return migrateV3ToV4(migrateV2ToV3(migrateV1ToV2(parsed)));
+      return remapDeduplicatedStorage(
+        migrateV3ToV4(migrateV2ToV3(migrateV1ToV2(parsed))),
+      );
     }
     if (parsed.version === 2) {
-      return migrateV3ToV4(migrateV2ToV3(parsed));
+      return remapDeduplicatedStorage(migrateV3ToV4(migrateV2ToV3(parsed)));
     }
     if (parsed.version === 3) {
-      return migrateV3ToV4(parsed);
+      return remapDeduplicatedStorage(migrateV3ToV4(parsed));
     }
 
-    return {
-      ...parsed,
-      accounts: deduplicateAccountsByEmail(parsed.accounts),
-    };
+    if (parsed.version === 4) {
+      return remapDeduplicatedStorage(parsed);
+    }
+
+    return null;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {
@@ -777,6 +896,25 @@ async function loadAccountsUnsafe(): Promise<AccountStorageV4 | null> {
     }
     return null;
   }
+}
+
+function remapDeduplicatedStorage(storage: AccountStorageV4): AccountStorageV4 {
+  const deduplicatedAccounts = deduplicateAccountsByEmail(storage.accounts);
+
+  return {
+    ...storage,
+    accounts: deduplicatedAccounts,
+    activeIndex: remapActiveIndex(
+      storage.accounts,
+      deduplicatedAccounts,
+      storage.activeIndex,
+    ),
+    activeIndexByFamily: remapActiveIndexByFamily(
+      storage.activeIndexByFamily,
+      storage.accounts,
+      deduplicatedAccounts,
+    ),
+  };
 }
 
 export async function clearAccounts(): Promise<void> {
