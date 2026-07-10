@@ -7,6 +7,7 @@ import {
   getAgySdkCredentials,
   fetchGeminiApiModels,
   isAgySdkSupportedRequest,
+  isRetryableAgySdkCredentialStatus,
   isAntigravityOnlyGenerativeLanguageRequest,
   isLikelyAntigravityOnlyModel,
   prepareAgySdkGeminiRequest,
@@ -37,6 +38,39 @@ describe("api-key agy sdk support", () => {
   beforeEach(() => {
     resetAgySdkCredentialStateForTests();
     resetPublicGeminiApiModelCatalogForTests();
+  });
+
+  it("retries another API key for credential failures and temporary capacity responses", () => {
+    // Given: responses that make the current key unusable or temporarily unavailable
+    const retryableStatuses = [401, 403, 429, 503, 529];
+
+    // When: classifying each response status
+    const retryable = retryableStatuses.map(isRetryableAgySdkCredentialStatus);
+
+    // Then: the credential loop can rotate to another configured key
+    expect(retryable).toEqual([true, true, true, true, true]);
+  });
+
+  it("does not rotate API keys for request and model errors", () => {
+    // Given: errors unrelated to the selected credential
+    const nonRetryableStatuses = [400, 404];
+
+    // When: classifying each response status
+    const retryable = nonRetryableStatuses.map(isRetryableAgySdkCredentialStatus);
+
+    // Then: the response remains visible to the caller
+    expect(retryable).toEqual([false, false]);
+  });
+
+  it("keeps image generation requests on Antigravity", () => {
+    // Given: an image model request on the public Gemini hostname
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:generateContent";
+
+    // When: checking whether the API-key route supports it
+    const supported = isAgySdkSupportedRequest(url);
+
+    // Then: the request remains on the Antigravity-only path
+    expect(supported).toBe(false);
   });
 
   it("loads API key credentials from auth, config cloud projects, and environment", () => {

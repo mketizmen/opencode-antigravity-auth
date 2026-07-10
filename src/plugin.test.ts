@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { PluginClient } from "./plugin/types";
+import { AccountManager } from "./plugin/accounts";
 
 vi.mock("@opencode-ai/plugin", () => ({
   tool: Object.assign(
@@ -27,6 +28,7 @@ vi.mock("./plugin/storage", async (importOriginal) => {
     loadAccounts: vi.fn(async () => null),
     saveAccounts: vi.fn(async () => undefined),
     saveAccountsReplace: vi.fn(async () => undefined),
+    removeAccountFromStorage: vi.fn(async () => undefined),
     clearAccounts: vi.fn(async () => undefined),
   };
 });
@@ -128,6 +130,8 @@ describe("createAntigravityPlugin provider models", () => {
 describe("createAntigravityPlugin auth.loader disk OAuth promotion", () => {
   beforeEach(() => {
     vi.mocked(storageModule.loadAccounts).mockReset();
+    vi.mocked(storageModule.saveAccountsReplace).mockReset();
+    vi.mocked(storageModule.removeAccountFromStorage).mockReset();
   });
 
   it("routes through the OAuth path when OpenCode reports API-key auth but OAuth accounts exist on disk", async () => {
@@ -258,6 +262,186 @@ describe("createAntigravityPlugin auth.loader disk OAuth promotion", () => {
     }
   });
 
+  it("uses Gemini CLI when Antigravity soft quota is exhausted", async () => {
+    const now = Date.now();
+    vi.mocked(storageModule.loadAccounts).mockResolvedValue({
+      version: 4,
+      accounts: [
+        {
+          email: "test@example.com",
+          refreshToken: "refresh-token",
+          projectId: "project-id",
+          managedProjectId: "managed-project-id",
+          addedAt: now,
+          lastUsed: now,
+          enabled: true,
+          cachedQuotaUpdatedAt: now,
+          cachedQuota: {
+            "gemini-pro": {
+              remainingFraction: 0,
+              modelCount: 1,
+            },
+          },
+        },
+      ],
+      activeIndex: 0,
+    });
+
+    const fetchedUrls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo) => {
+      const url = String(input);
+      fetchedUrls.push(url);
+      if (url.includes("oauth2.googleapis.com")) {
+        return new Response(JSON.stringify({
+          access_token: "access-token",
+          expires_in: 3600,
+          token_type: "Bearer",
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.includes("v1internal:generateContent")) {
+        return new Response(JSON.stringify({
+          response: {
+            candidates: [
+              {
+                content: { parts: [{ text: "ok" }], role: "model" },
+                finishReason: "STOP",
+                index: 0,
+              },
+            ],
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("1.2.3");
+    }));
+
+    try {
+      const plugin = await createAntigravityPlugin("google")({
+        client,
+        directory: process.cwd(),
+      });
+      const loader = await plugin.auth.loader(
+        async () => ({
+          type: "oauth",
+          refresh: formatRefreshParts({
+            refreshToken: "refresh-token",
+            projectId: "project-id",
+            managedProjectId: "managed-project-id",
+          }),
+          access: "access-token",
+          expires: now + 60_000,
+        }),
+        {
+          id: "google",
+          api: "https://generativelanguage.googleapis.com/v1beta",
+          npm: "@ai-sdk/google",
+          models: {},
+        },
+      );
+
+      const response = await (loader as { fetch: typeof fetch }).fetch(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+        {
+          method: "POST",
+          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hello" }] }] }),
+        },
+      );
+
+      expect(response.status).toBe(200);
+      expect(fetchedUrls, JSON.stringify(fetchedUrls)).toContain(
+        "https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("checks aggregate soft quota against the preferred Gemini CLI pool", async () => {
+    const configDir = join(tmpdir(), `opencode-antigravity-cli-quota-${process.pid}-${Date.now()}`);
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, "antigravity.json"), JSON.stringify({
+      cli_first: true,
+      max_rate_limit_wait_seconds: 1,
+      agy_sdk: {
+        enabled: false,
+        prefer_for_gemini: false,
+        api_key_fallback: false,
+        cloud_projects: [],
+      },
+    }));
+    const previousConfigDir = process.env.OPENCODE_CONFIG_DIR;
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    vi.mocked(storageModule.loadAccounts).mockResolvedValue({
+      version: 4,
+      accounts: [
+        {
+          email: "test@example.com",
+          refreshToken: "refresh-token",
+          projectId: "project-id",
+          managedProjectId: "managed-project-id",
+          addedAt: Date.now(),
+          lastUsed: Date.now(),
+          enabled: true,
+        },
+      ],
+      activeIndex: 0,
+    });
+    const selectionSpy = vi.spyOn(AccountManager.prototype, "getCurrentOrNextForFamily").mockReturnValue(null);
+    const aggregateSpy = vi.spyOn(AccountManager.prototype, "areAllAccountsOverSoftQuota").mockReturnValue(false);
+    const waitSpy = vi.spyOn(AccountManager.prototype, "getMinWaitTimeForFamily").mockReturnValue(2_000);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("unexpected", { status: 500 })));
+
+    try {
+      const plugin = await createAntigravityPlugin("google")({
+        client,
+        directory: process.cwd(),
+      });
+      const loader = await plugin.auth.loader(
+        async () => ({
+          type: "oauth",
+          refresh: formatRefreshParts({
+            refreshToken: "refresh-token",
+            projectId: "project-id",
+            managedProjectId: "managed-project-id",
+          }),
+          access: "access-token",
+          expires: Date.now() + 60_000,
+        }),
+        {
+          id: "google",
+          api: "https://generativelanguage.googleapis.com/v1beta",
+          npm: "@ai-sdk/google",
+          models: {},
+        },
+      );
+
+      await expect(
+        (loader as { fetch: typeof fetch }).fetch(
+          "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+          { method: "POST", body: "{}" },
+        ),
+      ).rejects.toThrow("All 1 account(s) rate-limited for gemini");
+
+      expect(aggregateSpy).toHaveBeenCalledWith(
+        "gemini",
+        90,
+        expect.any(Number),
+        "gemini-2.5-pro",
+        "gemini-cli",
+      );
+    } finally {
+      selectionSpy.mockRestore();
+      aggregateSpy.mockRestore();
+      waitSpy.mockRestore();
+      vi.unstubAllGlobals();
+      if (previousConfigDir === undefined) {
+        delete process.env.OPENCODE_CONFIG_DIR;
+      } else {
+        process.env.OPENCODE_CONFIG_DIR = previousConfigDir;
+      }
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
   it("does NOT call client.auth.set when promoted-from-disk OAuth hits invalid_grant", async () => {
     // Disk holds an OAuth account; OpenCode hands us api-key auth. After my fix,
     // when the (only) promoted OAuth account fails with invalid_grant, the plugin
@@ -339,6 +523,7 @@ describe("createAntigravityPlugin auth.loader disk OAuth promotion", () => {
       // CRITICAL: client.auth.set must NOT have been called — doing so would
       // wipe OpenCode's api-key auth for the google provider.
       expect(authSetSpy).not.toHaveBeenCalled();
+      expect(storageModule.removeAccountFromStorage).toHaveBeenCalledWith("fake-refresh-token");
     } finally {
       vi.unstubAllGlobals();
     }

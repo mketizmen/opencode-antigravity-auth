@@ -1,5 +1,5 @@
 import { formatRefreshParts, parseRefreshParts } from "./auth";
-import { loadAccounts, saveAccounts, type AccountStorageV4, type AccountMetadataV3, type RateLimitStateV3, type ModelFamily, type HeaderStyle, type CooldownReason } from "./storage";
+import { loadAccounts, removeAccountFromStorage, saveAccounts, saveAccountsReplace, type AccountStorageV4, type AccountMetadataV3, type RateLimitStateV3, type ModelFamily, type HeaderStyle, type CooldownReason } from "./storage";
 import type { OAuthAuthDetails, RefreshParts } from "./types";
 import type { AccountSelectionStrategy } from "./config/schema";
 import { getHealthTracker, getTokenTracker, selectHybridAccount, type AccountWithMetrics } from "./rotation";
@@ -246,10 +246,12 @@ export function resolveQuotaGroup(family: ModelFamily, model?: string | null): Q
 function isOverSoftQuotaThreshold(
   account: ManagedAccount,
   family: ModelFamily,
+  headerStyle: HeaderStyle,
   thresholdPercent: number,
   cacheTtlMs: number,
   model?: string | null
 ): boolean {
+  if (headerStyle === "gemini-cli") return false;
   if (thresholdPercent >= 100) return false;
   if (!account.cachedQuota) return false;
   
@@ -261,6 +263,8 @@ function isOverSoftQuotaThreshold(
   
   const groupData = account.cachedQuota[quotaGroup];
   if (groupData?.remainingFraction == null) return false;
+  const resetTimestamp = groupData.resetTime ? Date.parse(groupData.resetTime) : Number.NaN;
+  if (Number.isFinite(resetTimestamp) && resetTimestamp <= nowMs()) return false;
   
   const remainingFraction = Math.max(0, Math.min(1, groupData.remainingFraction));
   const usedPercent = (1 - remainingFraction) * 100;
@@ -312,6 +316,7 @@ export class AccountManager {
   private savePending = false;
   private saveTimeout: ReturnType<typeof setTimeout> | null = null;
   private savePromiseResolvers: Array<() => void> = [];
+  private saveQueue: Promise<void> = Promise.resolve();
 
   static async loadFromDisk(authFallback?: OAuthAuthDetails): Promise<AccountManager> {
     const stored = await loadAccounts();
@@ -537,7 +542,7 @@ export class AccountManager {
             lastUsed: acc.lastUsed,
             healthScore: healthTracker.getScore(acc.index),
             isRateLimited: isRateLimitedForFamily(acc, family, model) || 
-                          isOverSoftQuotaThreshold(acc, family, softQuotaThresholdPercent, softQuotaCacheTtlMs, model),
+                          isOverSoftQuotaThreshold(acc, family, headerStyle, softQuotaThresholdPercent, softQuotaCacheTtlMs, model),
             isCoolingDown: this.isAccountCoolingDown(acc),
           };
         });
@@ -575,7 +580,7 @@ export class AccountManager {
     if (current && !excludeIndices?.has(current.index)) {
       clearExpiredRateLimits(current);
       const isLimitedForRequestedStyle = isRateLimitedForHeaderStyle(current, family, headerStyle, model);
-      const isOverThreshold = isOverSoftQuotaThreshold(current, family, softQuotaThresholdPercent, softQuotaCacheTtlMs, model);
+      const isOverThreshold = isOverSoftQuotaThreshold(current, family, headerStyle, softQuotaThresholdPercent, softQuotaCacheTtlMs, model);
       if (!isLimitedForRequestedStyle && !isOverThreshold && !this.isAccountCoolingDown(current)) {
         this.markTouchedForQuota(current, quotaKey);
         return current;
@@ -596,7 +601,7 @@ export class AccountManager {
       return a.enabled !== false &&
              !excludeIndices?.has(a.index) &&
              !isRateLimitedForHeaderStyle(a, family, headerStyle, model) &&
-             !isOverSoftQuotaThreshold(a, family, softQuotaThresholdPercent, softQuotaCacheTtlMs, model) &&
+             !isOverSoftQuotaThreshold(a, family, headerStyle, softQuotaThresholdPercent, softQuotaCacheTtlMs, model) &&
              !this.isAccountCoolingDown(a);
     });
 
@@ -990,11 +995,17 @@ export class AccountManager {
     return [...this.accounts];
   }
 
-  async saveToDisk(): Promise<void> {
+  async saveToDisk(replace = false): Promise<void> {
+    const storage = this.createStorageSnapshot();
+    return this.enqueueStorageOperation(() => replace
+      ? saveAccountsReplace(storage)
+      : saveAccounts(storage));
+  }
+
+  private createStorageSnapshot(): AccountStorageV4 {
     const claudeIndex = Math.max(0, this.currentAccountIndexByFamily.claude);
     const geminiIndex = Math.max(0, this.currentAccountIndexByFamily.gemini);
-    
-    const storage: AccountStorageV4 = {
+    return {
       version: 4,
       accounts: this.accounts.map((a) => ({
         email: a.email,
@@ -1023,8 +1034,42 @@ export class AccountManager {
         gemini: geminiIndex,
       },
     };
+  }
 
-    await saveAccounts(storage);
+  async persistAccountRemoval(refreshToken: string): Promise<void> {
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout);
+      this.saveTimeout = null;
+    }
+    this.savePending = false;
+
+    const storage = this.createStorageSnapshot();
+
+    try {
+      await this.enqueueStorageOperation(async () => {
+        await saveAccounts(storage);
+        await removeAccountFromStorage(refreshToken);
+      });
+    } finally {
+      this.resolveSavePromises();
+    }
+  }
+
+  private enqueueStorageOperation(operation: () => Promise<void>): Promise<void> {
+    const result = this.saveQueue.then(operation);
+    this.saveQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private resolveSavePromises(): void {
+    const resolvers = this.savePromiseResolvers;
+    this.savePromiseResolvers = [];
+    for (const resolve of resolvers) {
+      resolve();
+    }
   }
 
   requestSaveToDisk(): void {
@@ -1055,11 +1100,7 @@ export class AccountManager {
     } catch {
       // best-effort persistence; avoid unhandled rejection from timer-driven saves
     } finally {
-      const resolvers = this.savePromiseResolvers;
-      this.savePromiseResolvers = [];
-      for (const resolve of resolvers) {
-        resolve();
-      }
+      this.resolveSavePromises();
     }
   }
 
@@ -1165,8 +1206,8 @@ export class AccountManager {
     }
   }
 
-  isAccountOverSoftQuota(account: ManagedAccount, family: ModelFamily, thresholdPercent: number, cacheTtlMs: number, model?: string | null): boolean {
-    return isOverSoftQuotaThreshold(account, family, thresholdPercent, cacheTtlMs, model);
+  isAccountOverSoftQuota(account: ManagedAccount, family: ModelFamily, thresholdPercent: number, cacheTtlMs: number, model?: string | null, headerStyle: HeaderStyle = "antigravity"): boolean {
+    return isOverSoftQuotaThreshold(account, family, headerStyle, thresholdPercent, cacheTtlMs, model);
   }
 
   getAccountsForQuotaCheck(): AccountMetadataV3[] {
@@ -1192,11 +1233,11 @@ export class AccountManager {
     return oldest;
   }
 
-  areAllAccountsOverSoftQuota(family: ModelFamily, thresholdPercent: number, cacheTtlMs: number, model?: string | null): boolean {
+  areAllAccountsOverSoftQuota(family: ModelFamily, thresholdPercent: number, cacheTtlMs: number, model?: string | null, headerStyle: HeaderStyle = "antigravity"): boolean {
     if (thresholdPercent >= 100) return false;
     const enabled = this.accounts.filter(a => a.enabled !== false);
     if (enabled.length === 0) return false;
-    return enabled.every(a => isOverSoftQuotaThreshold(a, family, thresholdPercent, cacheTtlMs, model));
+    return enabled.every(a => isOverSoftQuotaThreshold(a, family, headerStyle, thresholdPercent, cacheTtlMs, model));
   }
 
   /**
@@ -1209,7 +1250,8 @@ export class AccountManager {
     family: ModelFamily,
     thresholdPercent: number,
     cacheTtlMs: number,
-    model?: string | null
+    model?: string | null,
+    headerStyle: HeaderStyle = "antigravity"
   ): number | null {
     if (thresholdPercent >= 100) return 0;
     
@@ -1217,7 +1259,7 @@ export class AccountManager {
     if (enabled.length === 0) return null;
     
     // If any account is available (not over threshold), no wait needed
-    const available = enabled.filter(a => !isOverSoftQuotaThreshold(a, family, thresholdPercent, cacheTtlMs, model));
+    const available = enabled.filter(a => !isOverSoftQuotaThreshold(a, family, headerStyle, thresholdPercent, cacheTtlMs, model));
     if (available.length > 0) return 0;
     
     // All accounts are over threshold - find earliest reset time

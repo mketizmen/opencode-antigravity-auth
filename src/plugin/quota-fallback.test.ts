@@ -1,5 +1,7 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { HeaderStyle, ModelFamily } from "./accounts";
+import { resetAgySdkCredentialStateForTests } from "./api-key";
+import type { AgySdkCredential } from "./api-key";
 
 type ResolveQuotaFallbackHeaderStyle = (input: {
   family: ModelFamily;
@@ -43,10 +45,18 @@ type VerifyAccountAccess = (
   providerId: string,
 ) => Promise<{ status: string; message: string; verifyUrl?: string }>;
 
+type TryFetchWithAgySdkCredentials = (
+  input: RequestInfo,
+  init: RequestInit | undefined,
+  credentials: AgySdkCredential[],
+  fallbackRetryAfterMs: number,
+) => Promise<Response | null>;
+
 let resolveQuotaFallbackHeaderStyle: ResolveQuotaFallbackHeaderStyle | undefined;
 let getHeaderStyleFromUrl: GetHeaderStyleFromUrl | undefined;
 let resolveHeaderRoutingDecision: ResolveHeaderRoutingDecision | undefined;
 let createSoftQuotaBlockedResponse: CreateSoftQuotaBlockedResponse | undefined;
+let tryFetchWithAgySdkCredentials: TryFetchWithAgySdkCredentials | undefined;
 let verifyAccountAccess: VerifyAccountAccess | undefined;
 
 beforeAll(async () => {
@@ -67,9 +77,87 @@ beforeAll(async () => {
   createSoftQuotaBlockedResponse = (__testExports as {
     createSoftQuotaBlockedResponse?: CreateSoftQuotaBlockedResponse;
   }).createSoftQuotaBlockedResponse;
+  tryFetchWithAgySdkCredentials = (__testExports as {
+    tryFetchWithAgySdkCredentials?: TryFetchWithAgySdkCredentials;
+  }).tryFetchWithAgySdkCredentials;
   verifyAccountAccess = (__testExports as {
     verifyAccountAccess?: VerifyAccountAccess;
   }).verifyAccountAccess;
+});
+
+describe("API-key fallback credentials", () => {
+  it("tries a later API key when the first credential is forbidden", async () => {
+    resetAgySdkCredentialStateForTests();
+    const fetchMock = vi.fn(async (_input: RequestInfo, init?: RequestInit) => {
+      const apiKey = new Headers(init?.headers).get("x-goog-api-key");
+      return apiKey === "bad-key"
+        ? new Response("forbidden", { status: 403 })
+        : new Response("ok", { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const response = await tryFetchWithAgySdkCredentials?.(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+        { method: "POST", body: "{}" },
+        [
+          { label: "bad", apiKey: "bad-key" },
+          { label: "good", apiKey: "good-key" },
+        ],
+        60_000,
+      );
+
+      expect(response?.status).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("tries every available key when concurrent requests advance the shared cursor", async () => {
+    resetAgySdkCredentialStateForTests();
+    const badRequestStarted = Promise.withResolvers<void>();
+    const releaseBadRequest = Promise.withResolvers<void>();
+    const fetchMock = vi.fn(async (_input: RequestInfo, init?: RequestInit) => {
+      const apiKey = new Headers(init?.headers).get("x-goog-api-key");
+      if (apiKey === "bad-key") {
+        badRequestStarted.resolve();
+        await releaseBadRequest.promise;
+        return new Response("forbidden", { status: 403 });
+      }
+      return new Response("ok", { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const credentials = [
+      { label: "bad", apiKey: "bad-key" },
+      { label: "good", apiKey: "good-key" },
+    ];
+
+    try {
+      const firstResponsePromise = tryFetchWithAgySdkCredentials?.(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+        { method: "POST", body: "{}" },
+        credentials,
+        60_000,
+      );
+      await badRequestStarted.promise;
+
+      const secondResponse = await tryFetchWithAgySdkCredentials?.(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+        { method: "POST", body: "{}" },
+        credentials,
+        60_000,
+      );
+      releaseBadRequest.resolve();
+      const firstResponse = await firstResponsePromise;
+
+      expect(secondResponse?.status).toBe(200);
+      expect(firstResponse?.status).toBe(200);
+    } finally {
+      releaseBadRequest.resolve();
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe("quota fallback direction", () => {
@@ -195,6 +283,23 @@ describe("header routing decision", () => {
       preferredHeaderStyle: "antigravity",
       explicitQuota: true,
       allowQuotaFallback: true,
+    });
+  });
+
+  it("keeps image models on Antigravity without quota fallback", () => {
+    const decision = resolveHeaderRoutingDecision?.(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:streamGenerateContent",
+      "gemini",
+      {
+        cli_first: true,
+      },
+    );
+
+    expect(decision).toMatchObject({
+      cliFirst: true,
+      preferredHeaderStyle: "antigravity",
+      explicitQuota: true,
+      allowQuotaFallback: false,
     });
   });
 

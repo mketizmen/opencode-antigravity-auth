@@ -3,8 +3,11 @@ import {
   deduplicateAccountsByEmail,
   migrateV2ToV3,
   loadAccounts,
+  removeAccountFromStorage,
+  saveAccounts,
   type AccountMetadata,
   type AccountStorage,
+  type AccountStorageV4,
 } from "./storage";
 import { promises as fs } from "node:fs";
 import {
@@ -209,6 +212,72 @@ describe("deduplicateAccountsByEmail", () => {
   });
 });
 
+describe("removeAccountFromStorage", () => {
+  it("removes only the revoked identity while preserving concurrently added accounts", async () => {
+    const stored = {
+      version: 4,
+      accounts: [
+        { refreshToken: "revoked", email: "revoked@example.com", addedAt: 1, lastUsed: 1 },
+        { refreshToken: "existing", email: "existing@example.com", addedAt: 2, lastUsed: 2 },
+        { refreshToken: "concurrent", email: "concurrent@example.com", addedAt: 3, lastUsed: 3 },
+      ],
+      activeIndex: 2,
+      activeIndexByFamily: { claude: 1, gemini: 2 },
+    } satisfies AccountStorageV4;
+    vi.mocked(fs.readFile).mockImplementation(async (path) => {
+      if (String(path).endsWith(".gitignore")) {
+        return [
+          "antigravity-accounts.json",
+          "antigravity-accounts.json.*.tmp",
+          "antigravity-signature-cache.json",
+          "antigravity-logs/",
+        ].join("\n");
+      }
+      return JSON.stringify(stored);
+    });
+
+    await removeAccountFromStorage("revoked");
+
+    const saveCall = vi.mocked(fs.writeFile).mock.calls.find(
+      ([path]) => String(path).includes(".tmp"),
+    );
+    if (!saveCall) throw new Error("Account storage was not written");
+    const saved = JSON.parse(String(saveCall[1])) as AccountStorageV4;
+    expect(saved.accounts.map((account) => account.refreshToken)).toEqual(["existing", "concurrent"]);
+    expect(saved.activeIndex).toBe(1);
+    expect(saved.activeIndexByFamily).toEqual({ claude: 0, gemini: 1 });
+  });
+
+  it("does not resurrect a removed account when a stale snapshot saves later", async () => {
+    const initial: AccountStorageV4 = {
+      version: 4,
+      accounts: [
+        { refreshToken: "revoked", addedAt: 1, lastUsed: 1 },
+        { refreshToken: "valid", addedAt: 2, lastUsed: 2 },
+      ],
+      activeIndex: 1,
+      activeIndexByFamily: { claude: 1, gemini: 1 },
+    };
+    let diskContent = JSON.stringify(initial);
+    vi.mocked(fs.readFile).mockImplementation(async (path) => {
+      if (String(path).endsWith(".gitignore")) return "";
+      return diskContent;
+    });
+    vi.mocked(fs.writeFile).mockImplementation(async (path, data) => {
+      if (String(path).includes(".tmp")) diskContent = String(data);
+    });
+
+    await removeAccountFromStorage("revoked");
+    await saveAccounts(initial);
+
+    const saved = JSON.parse(diskContent) as AccountStorageV4;
+    expect(saved.accounts.map((account) => account.refreshToken)).toEqual(["valid"]);
+    expect(saved.activeIndex).toBe(0);
+    expect(saved.activeIndexByFamily).toEqual({ claude: 0, gemini: 0 });
+    expect(diskContent).not.toContain("revoked");
+  });
+});
+
 vi.mock("node:fs", async () => {
   const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
   return {
@@ -371,6 +440,99 @@ describe("Storage Migration", () => {
   describe("loadAccounts migration integration", () => {
     beforeEach(() => {
       vi.clearAllMocks();
+    });
+
+    it("keeps the selected account when email deduplication reorders accounts", async () => {
+      // Given: the persisted index selects B between two versions of A.
+      vi.mocked(fs.readFile).mockResolvedValue(
+        JSON.stringify({
+          version: 4,
+          accounts: [
+            {
+              email: "a@example.com",
+              refreshToken: "a-old",
+              addedAt: 1,
+              lastUsed: 1,
+            },
+            {
+              email: "b@example.com",
+              refreshToken: "b",
+              addedAt: 2,
+              lastUsed: 2,
+            },
+            {
+              email: "a@example.com",
+              refreshToken: "a-new",
+              addedAt: 3,
+              lastUsed: 3,
+            },
+          ],
+          activeIndex: 1,
+        }),
+      );
+
+      // When: storage is loaded and A's old entry is removed.
+      const result = await loadAccounts();
+
+      // Then: B remains the active account even though it moved to index zero.
+      expect(result?.accounts.map((account) => account.email)).toEqual([
+        "b@example.com",
+        "a@example.com",
+      ]);
+      expect(result?.activeIndex).toBe(0);
+      expect(result?.accounts[result.activeIndex ?? 0]?.email).toBe(
+        "b@example.com",
+      );
+    });
+
+    it("remaps family selections by account identity after email deduplication", async () => {
+      // Given: Claude selects A while Gemini selects B in the persisted ordering.
+      vi.mocked(fs.readFile).mockResolvedValue(
+        JSON.stringify({
+          version: 4,
+          accounts: [
+            {
+              email: "a@example.com",
+              refreshToken: "a-old",
+              addedAt: 1,
+              lastUsed: 1,
+            },
+            {
+              email: "b@example.com",
+              refreshToken: "b",
+              addedAt: 2,
+              lastUsed: 2,
+            },
+            {
+              email: "a@example.com",
+              refreshToken: "a-new",
+              addedAt: 3,
+              lastUsed: 3,
+            },
+          ],
+          activeIndex: 0,
+          activeIndexByFamily: {
+            claude: 0,
+            gemini: 1,
+          },
+        }),
+      );
+
+      // When: storage is loaded and duplicate emails are compacted.
+      const result = await loadAccounts();
+
+      // Then: family choices still resolve to their originally selected emails.
+      expect(result?.activeIndex).toBe(1);
+      expect(result?.activeIndexByFamily).toEqual({
+        claude: 1,
+        gemini: 0,
+      });
+      expect(
+        result?.accounts[result.activeIndexByFamily?.claude ?? 0]?.email,
+      ).toBe("a@example.com");
+      expect(
+        result?.accounts[result.activeIndexByFamily?.gemini ?? 0]?.email,
+      ).toBe("b@example.com");
     });
 
     it("migrates V2 storage on load and persists V4", async () => {

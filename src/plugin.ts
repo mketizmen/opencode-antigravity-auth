@@ -41,7 +41,7 @@ import {
 import { EmptyResponseError } from "./plugin/errors";
 import { AntigravityTokenRefreshError, refreshAccessToken } from "./plugin/token";
 import { startOAuthListener, type OAuthListener } from "./plugin/server";
-import { clearAccounts, loadAccounts, saveAccounts, saveAccountsReplace } from "./plugin/storage";
+import { clearAccounts, loadAccounts, removeAccountFromStorage, saveAccounts } from "./plugin/storage";
 import { AccountManager, type ModelFamily, parseRateLimitReason, calculateBackoffMs, computeSoftQuotaCacheTtlMs } from "./plugin/accounts";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker";
 import { loadConfig, initRuntimeConfig, type AntigravityConfig } from "./plugin/config";
@@ -62,6 +62,7 @@ import {
   isAgySdkSupportedRequest,
   isAntigravityOnlyGenerativeLanguageRequest,
   isApiKeyAuth,
+  isRetryableAgySdkCredentialStatus,
   selectAgySdkCredential,
 } from "./plugin/api-key";
 import {
@@ -145,10 +146,6 @@ function resetAllAccountsBlockedToasts(): void {
 
 const quotaRefreshInProgressByEmail = new Set<string>();
 
-function isRetryableAgySdkCapacityStatus(status: number): boolean {
-  return status === 429 || status === 503 || status === 529;
-}
-
 function defaultRetryMsForConfig(config: AntigravityConfig): number {
   return (config.default_retry_after_seconds ?? 60) * 1000;
 }
@@ -164,13 +161,15 @@ async function tryFetchWithAgySdkCredentials(
   let lastResponse: Response | null = null;
 
   while (attempted.size < credentials.length) {
-    const credential = selectAgySdkCredential(credentials);
-    if (!credential || attempted.has(credential.apiKey)) {
+    const credential = selectAgySdkCredential(
+      credentials.filter((candidate) => !attempted.has(candidate.apiKey)),
+    );
+    if (!credential) {
       break;
     }
     attempted.add(credential.apiKey);
     const response = await fetchWithAgySdkCredential(input, init, credential, fallbackRetryAfterMs);
-    if (!isRetryableAgySdkCapacityStatus(response.status)) {
+    if (!isRetryableAgySdkCredentialStatus(response.status)) {
       return response;
     }
     lastResponse = response;
@@ -1995,7 +1994,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 agySdkCredentials,
                 (config.default_retry_after_seconds ?? 60) * 1000,
               );
-              if (response && !isRetryableAgySdkCapacityStatus(response.status)) {
+              if (response && !isRetryableAgySdkCredentialStatus(response.status)) {
                 return response;
               }
             }
@@ -2011,6 +2010,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
               config.quota_refresh_interval_minutes,
             );
 
+            let selectedHeaderStyle = preferredHeaderStyle;
             let account = accountManager.getCurrentOrNextForFamily(
               family,
               model,
@@ -2036,6 +2036,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 triedSwitchIndices,
               );
               if (account) {
+                selectedHeaderStyle = alternateHeaderStyle;
                 pushDebug(
                   `selected-by-fallback idx=${account.index} preferred=${preferredHeaderStyle} alternate=${alternateHeaderStyle}`,
                 );
@@ -2072,9 +2073,21 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   "Run `opencode auth login` to add accounts or wait for quota reset.",
                 );
               }
-              if (accountManager.areAllAccountsOverSoftQuota(family, config.soft_quota_threshold_percent, softQuotaCacheTtlMs, model)) {
+              if (accountManager.areAllAccountsOverSoftQuota(
+                family,
+                config.soft_quota_threshold_percent,
+                softQuotaCacheTtlMs,
+                model,
+                preferredHeaderStyle,
+              )) {
                 const threshold = config.soft_quota_threshold_percent;
-                const softQuotaWaitMs = accountManager.getMinWaitTimeForSoftQuota(family, threshold, softQuotaCacheTtlMs, model);
+                const softQuotaWaitMs = accountManager.getMinWaitTimeForSoftQuota(
+                  family,
+                  threshold,
+                  softQuotaCacheTtlMs,
+                  model,
+                  preferredHeaderStyle,
+                );
                 const maxWaitMs = (config.max_rate_limit_wait_seconds ?? 300) * 1000;
                 const response = await tryAgySdkFallbackForRequest(input, init, config, agySdkCredentials, urlString);
                 if (response) return response;
@@ -2219,7 +2232,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   if (removed) {
                     log.warn("Removed revoked account from pool - reauthenticate via `opencode auth login`");
                     try {
-                      await accountManager.saveToDisk();
+                      await accountManager.persistAccountRemoval(account.parts.refreshToken);
                     } catch (persistError) {
                       log.error("Failed to persist revoked account removal", { error: String(persistError) });
                     }
@@ -2386,7 +2399,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
             // - Models with antigravity- prefix -> use Antigravity quota
             // - Gemini models without explicit prefix -> follow cli_first
             // - Claude models -> always use Antigravity
-            let headerStyle = preferredHeaderStyle;
+            let headerStyle = selectedHeaderStyle;
             pushDebug(`headerStyle=${headerStyle} explicit=${explicitQuota}`);
             if (account.fingerprint) {
               pushDebug(`fingerprint: quotaUser=${account.fingerprint.quotaUser} deviceId=${account.fingerprint.deviceId.slice(0, 8)}...`);
@@ -3491,16 +3504,13 @@ export const createAntigravityPlugin = (providerId: string) => async (
               }
               
               if (menuResult.deleteAccountIndex !== undefined) {
+                const deletedAccount = existingStorage.accounts[menuResult.deleteAccountIndex];
                 const updatedAccounts = existingStorage.accounts.filter(
                   (_, idx) => idx !== menuResult.deleteAccountIndex
                 );
-                // Use saveAccountsReplace to bypass merge (otherwise deleted account gets merged back)
-                await saveAccountsReplace({
-                  version: 4,
-                  accounts: updatedAccounts,
-                  activeIndex: 0,
-                  activeIndexByFamily: { claude: 0, gemini: 0 },
-                });
+                if (deletedAccount) {
+                  await removeAccountFromStorage(deletedAccount.refreshToken);
+                }
                 // Sync in-memory state so deleted account stops being used immediately
                 activeAccountManager?.removeAccountByIndex(menuResult.deleteAccountIndex);
                 console.log("\nAccount deleted.\n");
@@ -4020,12 +4030,16 @@ function resolveHeaderRoutingDecision(
 ): HeaderRoutingDecision {
   const cliFirst = getCliFirst(config);
   const preferredHeaderStyle = getHeaderStyleFromUrl(urlString, family, cliFirst);
-  const explicitQuota = isExplicitQuotaFromUrl(urlString);
+  const modelWithSuffix = extractModelFromUrlWithSuffix(urlString);
+  const resolvedModel = modelWithSuffix
+    ? resolveModelWithTier(modelWithSuffix, { cli_first: cliFirst })
+    : null;
+  const explicitQuota = resolvedModel?.explicitQuota ?? false;
   return {
     cliFirst,
     preferredHeaderStyle,
     explicitQuota,
-    allowQuotaFallback: family === "gemini",
+    allowQuotaFallback: family === "gemini" && resolvedModel?.isImageModel !== true,
   };
 }
 
@@ -4049,18 +4063,10 @@ function getHeaderStyleFromUrl(
   return quotaPreference ?? "antigravity";
 }
 
-function isExplicitQuotaFromUrl(urlString: string): boolean {
-  const modelWithSuffix = extractModelFromUrlWithSuffix(urlString);
-  if (!modelWithSuffix) {
-    return false;
-  }
-  const { explicitQuota } = resolveModelWithTier(modelWithSuffix);
-  return explicitQuota ?? false;
-}
-
 export const __testExports = {
   getHeaderStyleFromUrl,
   createSoftQuotaBlockedResponse,
+  tryFetchWithAgySdkCredentials,
   verifyAccountAccess,
   resolveHeaderRoutingDecision,
   resolveQuotaFallbackHeaderStyle,

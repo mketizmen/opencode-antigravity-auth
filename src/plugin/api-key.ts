@@ -1,5 +1,5 @@
 import { extractVariantThinkingConfig } from "./request-helpers";
-import { applyGeminiTransforms, isGemini3Model, mapAntigravityModelToPublicApi, resolveModelForHeaderStyle } from "./transform";
+import { applyGeminiTransforms, isGemini3Model, isImageGenerationModel, mapAntigravityModelToPublicApi, resolveModelForHeaderStyle } from "./transform";
 import { getPublicGeminiApiModelIds } from "./model-catalog";
 import type { AntigravityConfig } from "./config";
 import type { GeminiApiModel } from "./config/models";
@@ -28,6 +28,10 @@ let cursor = 0;
 
 const GEMINI_MODELS_LIST_TIMEOUT_MS = 10000;
 const GEMINI_MODELS_LIST_MAX_PAGES = 20;
+
+export function isRetryableAgySdkCredentialStatus(status: number): boolean {
+  return status === 401 || status === 403 || status === 429 || status === 503 || status === 529;
+}
 
 export function resetAgySdkCredentialStateForTests(): void {
   rateLimitedUntilByKey.clear();
@@ -201,7 +205,7 @@ export function isAgySdkSupportedRequest(urlString: string): boolean {
   }
   if (url.hostname !== "generativelanguage.googleapis.com") return false;
   const model = extractGeminiModelFromUrl(url.toString());
-  if (!model || !model.toLowerCase().includes("gemini")) return false;
+  if (!model || !model.toLowerCase().includes("gemini") || isImageGenerationModel(model)) return false;
   return canRouteAsPublicGeminiApiModel(model);
 }
 
