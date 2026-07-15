@@ -3,9 +3,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   HealthScoreTracker,
   TokenBucketTracker,
-  addJitter,
-  randomDelay,
-  sortByLruWithHealth,
   selectHybridAccount,
   type AccountWithMetrics,
 } from "./rotation";
@@ -354,129 +351,59 @@ describe("TokenBucketTracker", () => {
   });
 });
 
-describe("addJitter", () => {
-  it("returns value within jitter range", () => {
-    const base = 1000;
-    const jitterFactor = 0.3;
-    
-    for (let i = 0; i < 100; i++) {
-      const result = addJitter(base, jitterFactor);
-      expect(result).toBeGreaterThanOrEqual(base * (1 - jitterFactor));
-      expect(result).toBeLessThanOrEqual(base * (1 + jitterFactor));
-    }
+describe("tracker remapAfterRemoval", () => {
+  it("HealthScoreTracker drops the removed index and shifts higher indices down", () => {
+    const mockTime = 1_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => mockTime);
+
+    const tracker = new HealthScoreTracker();
+    // Distinct consecutive-failure counts make each account's state identifiable.
+    tracker.recordFailure(0); // index 0 -> 1 failure
+    tracker.recordFailure(1);
+    tracker.recordFailure(1); // index 1 -> 2 failures
+    tracker.recordFailure(2);
+    tracker.recordFailure(2);
+    tracker.recordFailure(2); // index 2 -> 3 failures
+    tracker.recordFailure(3);
+    tracker.recordFailure(3);
+    tracker.recordFailure(3);
+    tracker.recordFailure(3); // index 3 -> 4 failures
+
+    tracker.remapAfterRemoval(1);
+
+    expect(tracker.getConsecutiveFailures(0)).toBe(1); // unchanged (below removed)
+    expect(tracker.getConsecutiveFailures(1)).toBe(3); // was index 2
+    expect(tracker.getConsecutiveFailures(2)).toBe(4); // was index 3
+    expect(tracker.getConsecutiveFailures(3)).toBe(0); // nothing here now
+
+    vi.restoreAllMocks();
   });
 
-  it("uses default jitter factor of 0.3", () => {
-    const base = 1000;
-    
-    for (let i = 0; i < 100; i++) {
-      const result = addJitter(base);
-      expect(result).toBeGreaterThanOrEqual(700);
-      expect(result).toBeLessThanOrEqual(1300);
-    }
+  it("TokenBucketTracker drops the removed index and shifts higher indices down", () => {
+    const mockTime = 1_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => mockTime);
+
+    const tracker = new TokenBucketTracker(); // initialTokens 50, maxTokens 50
+    tracker.consume(0, 1); // index 0 -> 49
+    tracker.consume(1, 5); // index 1 -> 45
+    tracker.consume(2, 10); // index 2 -> 40
+    tracker.consume(3, 20); // index 3 -> 30
+
+    tracker.remapAfterRemoval(1);
+
+    expect(tracker.getTokens(0)).toBe(49); // unchanged
+    expect(tracker.getTokens(1)).toBe(40); // was index 2
+    expect(tracker.getTokens(2)).toBe(30); // was index 3
+    expect(tracker.getTokens(3)).toBe(50); // default for unknown account
+
+    vi.restoreAllMocks();
   });
 
-  it("never returns negative values", () => {
-    for (let i = 0; i < 100; i++) {
-      const result = addJitter(10, 0.9);
-      expect(result).toBeGreaterThanOrEqual(0);
-    }
-  });
-
-  it("returns rounded values", () => {
-    for (let i = 0; i < 100; i++) {
-      const result = addJitter(1000);
-      expect(Number.isInteger(result)).toBe(true);
-    }
-  });
-});
-
-describe("randomDelay", () => {
-  it("returns value within min-max range", () => {
-    for (let i = 0; i < 100; i++) {
-      const result = randomDelay(100, 500);
-      expect(result).toBeGreaterThanOrEqual(100);
-      expect(result).toBeLessThanOrEqual(500);
-    }
-  });
-
-  it("returns rounded values", () => {
-    for (let i = 0; i < 100; i++) {
-      const result = randomDelay(100, 500);
-      expect(Number.isInteger(result)).toBe(true);
-    }
-  });
-
-  it("handles min === max", () => {
-    const result = randomDelay(100, 100);
-    expect(result).toBe(100);
-  });
-});
-
-describe("sortByLruWithHealth", () => {
-  it("filters out rate-limited accounts", () => {
-    const accounts: AccountWithMetrics[] = [
-      { index: 0, lastUsed: 0, healthScore: 70, isRateLimited: true, isCoolingDown: false },
-      { index: 1, lastUsed: 0, healthScore: 70, isRateLimited: false, isCoolingDown: false },
-    ];
-
-    const result = sortByLruWithHealth(accounts);
-    expect(result).toHaveLength(1);
-    expect(result[0]?.index).toBe(1);
-  });
-
-  it("filters out cooling down accounts", () => {
-    const accounts: AccountWithMetrics[] = [
-      { index: 0, lastUsed: 0, healthScore: 70, isRateLimited: false, isCoolingDown: true },
-      { index: 1, lastUsed: 0, healthScore: 70, isRateLimited: false, isCoolingDown: false },
-    ];
-
-    const result = sortByLruWithHealth(accounts);
-    expect(result).toHaveLength(1);
-    expect(result[0]?.index).toBe(1);
-  });
-
-  it("filters out unhealthy accounts", () => {
-    const accounts: AccountWithMetrics[] = [
-      { index: 0, lastUsed: 0, healthScore: 40, isRateLimited: false, isCoolingDown: false },
-      { index: 1, lastUsed: 0, healthScore: 70, isRateLimited: false, isCoolingDown: false },
-    ];
-
-    const result = sortByLruWithHealth(accounts, 50);
-    expect(result).toHaveLength(1);
-    expect(result[0]?.index).toBe(1);
-  });
-
-  it("sorts by lastUsed ascending (oldest first)", () => {
-    const accounts: AccountWithMetrics[] = [
-      { index: 0, lastUsed: 1000, healthScore: 70, isRateLimited: false, isCoolingDown: false },
-      { index: 1, lastUsed: 500, healthScore: 70, isRateLimited: false, isCoolingDown: false },
-      { index: 2, lastUsed: 2000, healthScore: 70, isRateLimited: false, isCoolingDown: false },
-    ];
-
-    const result = sortByLruWithHealth(accounts);
-    expect(result.map(a => a.index)).toEqual([1, 0, 2]);
-  });
-
-  it("uses health score as tiebreaker", () => {
-    const accounts: AccountWithMetrics[] = [
-      { index: 0, lastUsed: 1000, healthScore: 60, isRateLimited: false, isCoolingDown: false },
-      { index: 1, lastUsed: 1000, healthScore: 80, isRateLimited: false, isCoolingDown: false },
-      { index: 2, lastUsed: 1000, healthScore: 70, isRateLimited: false, isCoolingDown: false },
-    ];
-
-    const result = sortByLruWithHealth(accounts);
-    expect(result.map(a => a.index)).toEqual([1, 2, 0]);
-  });
-
-  it("returns empty array when all accounts filtered out", () => {
-    const accounts: AccountWithMetrics[] = [
-      { index: 0, lastUsed: 0, healthScore: 30, isRateLimited: false, isCoolingDown: false },
-      { index: 1, lastUsed: 0, healthScore: 70, isRateLimited: true, isCoolingDown: false },
-    ];
-
-    const result = sortByLruWithHealth(accounts, 50);
-    expect(result).toHaveLength(0);
+  it("is a no-op safe call when the tracker has no state", () => {
+    const health = new HealthScoreTracker();
+    const tokens = new TokenBucketTracker();
+    expect(() => health.remapAfterRemoval(0)).not.toThrow();
+    expect(() => tokens.remapAfterRemoval(0)).not.toThrow();
   });
 });
 

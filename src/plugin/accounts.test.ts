@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { AccountManager, type ModelFamily, parseRateLimitReason, calculateBackoffMs, resolveQuotaGroup } from "./accounts";
+import { AccountManager, type ModelFamily, parseRateLimitReason, calculateBackoffMs, resolveQuotaGroup, RATE_LIMIT_CLEAR_TTL_MS } from "./accounts";
 import type { AccountStorageV4 } from "./storage";
 import type { OAuthAuthDetails } from "./types";
 import * as storageModule from "./storage";
@@ -1964,6 +1964,255 @@ describe("AccountManager", () => {
       expect(waitMs).toBe(2 * 60 * 60 * 1000);
 
       vi.useRealTimers();
+    });
+  });
+
+  describe("hybrid strategy uses style-aware rate-limit check", () => {
+    it("does not select an account whose requested header-style pool is exhausted (other style has room)", () => {
+      const stored: AccountStorageV4 = {
+        version: 4,
+        accounts: [
+          { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      const family: ModelFamily = "gemini";
+      const model = "antigravity-gemini-3.1-pro";
+
+      // Exhaust ONLY the antigravity pool for this model; gemini-cli still has room.
+      const account = manager.getAccounts()[0]!;
+      manager.markRateLimited(account, 60_000, family, "antigravity", model);
+
+      // isRateLimitedForFamily would report false here (cli pool has room), so the
+      // buggy hybrid branch would happily select this account for antigravity.
+      const selected = manager.getCurrentOrNextForFamily(
+        family, model, "hybrid", "antigravity", false, 100, 600_000,
+      );
+
+      // With the style-aware check, no account is available for antigravity.
+      expect(selected).toBeNull();
+
+      // Sanity: the same account IS available for the gemini-cli style.
+      const cliSelected = manager.getCurrentOrNextForFamily(
+        family, model, "hybrid", "gemini-cli", false, 100, 600_000,
+      );
+      expect(cliSelected?.index).toBe(0);
+    });
+  });
+
+  describe("flushSaveToDisk awaits in-flight writes", () => {
+    it("resolves only after a write triggered by requestSaveToDisk has settled", async () => {
+      vi.useFakeTimers();
+      try {
+        const stored: AccountStorageV4 = {
+          version: 4,
+          accounts: [
+            { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+          ],
+          activeIndex: 0,
+        };
+        const manager = new AccountManager(undefined, stored);
+
+        let resolveSave: (() => void) | undefined;
+        let saveCompleted = false;
+        const saveToDiskSpy = vi
+          .spyOn(manager, "saveToDisk")
+          .mockImplementation(
+            () =>
+              new Promise<void>((resolve) => {
+                resolveSave = () => {
+                  saveCompleted = true;
+                  resolve();
+                };
+              }),
+          );
+
+        // Schedule a debounced save and let the 1s timer fire → executeSave starts,
+        // clears savePending, and begins the (still pending) write.
+        manager.requestSaveToDisk();
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(saveToDiskSpy).toHaveBeenCalledTimes(1);
+        expect(saveCompleted).toBe(false);
+
+        // flushSaveToDisk must NOT resolve while the write is still in flight.
+        let flushResolved = false;
+        const flush = manager.flushSaveToDisk().then(() => {
+          flushResolved = true;
+        });
+        await Promise.resolve();
+        expect(flushResolved).toBe(false);
+
+        // Complete the in-flight write; only now may flush resolve.
+        resolveSave?.();
+        await flush;
+        expect(flushResolved).toBe(true);
+        expect(saveCompleted).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("resolves only after BOTH an active save and a newer pending save settle", async () => {
+      vi.useFakeTimers();
+      try {
+        const stored: AccountStorageV4 = {
+          version: 4,
+          accounts: [
+            { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+          ],
+          activeIndex: 0,
+        };
+        const manager = new AccountManager(undefined, stored);
+
+        const resolvers: Array<() => void> = [];
+        const saveToDiskSpy = vi
+          .spyOn(manager, "saveToDisk")
+          .mockImplementation(
+            () => new Promise<void>((resolve) => { resolvers.push(resolve); }),
+          );
+
+        // Save A: schedule + fire timer → executeSave A starts write #1 (in flight),
+        // savePending cleared, activeSave = A.
+        manager.requestSaveToDisk();
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(saveToDiskSpy).toHaveBeenCalledTimes(1);
+
+        // Save B: a NEWER debounced save is scheduled while A is still in flight.
+        manager.requestSaveToDisk();
+
+        let flushResolved = false;
+        const flush = manager.flushSaveToDisk().then(() => { flushResolved = true; });
+        await Promise.resolve();
+        expect(flushResolved).toBe(false);
+
+        // Complete A. flush must NOT resolve — B's timer has not even fired yet.
+        resolvers[0]?.();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(flushResolved).toBe(false);
+
+        // B's debounce timer fires → executeSave B starts write #2 (in flight).
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(saveToDiskSpy).toHaveBeenCalledTimes(2);
+        expect(flushResolved).toBe(false);
+
+        // Only after B settles may flush resolve.
+        resolvers[1]?.();
+        await flush;
+        expect(flushResolved).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("snapshot records cleared quota keys", () => {
+    it("emits a clearedQuotaKeys marker so a cleared limit survives merge", async () => {
+      const stored: AccountStorageV4 = {
+        version: 4,
+        accounts: [
+          { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      };
+      const manager = new AccountManager(undefined, stored);
+      const account = manager.getAccounts()[0]!;
+
+      manager.markRateLimited(account, 60_000, "claude");
+      // Optimistic reset clears the claude limit in memory.
+      manager.clearAllRateLimitsForFamily("claude");
+
+      const saveSpy = vi.mocked(storageModule.saveAccounts);
+      saveSpy.mockClear();
+      await manager.saveToDisk();
+
+      expect(saveSpy).toHaveBeenCalledTimes(1);
+      const snapshot = saveSpy.mock.calls[0]![0];
+      const persisted = snapshot.accounts[0]!;
+      expect(persisted.rateLimitResetTimes?.claude).toBeUndefined();
+      expect(persisted.clearedQuotaKeys?.claude).toBeGreaterThan(0);
+    });
+
+    it("prunes expired, superseded, and dead markers from memory during serialization", async () => {
+      const stored: AccountStorageV4 = {
+        version: 4,
+        accounts: [
+          { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      };
+      const manager = new AccountManager(undefined, stored);
+      const account = manager.getAccounts()[0]!;
+      const now = Date.now();
+
+      // Expired clear marker (older than TTL) — must be dropped in place.
+      account.clearedQuotaKeys["claude"] = now - RATE_LIMIT_CLEAR_TTL_MS - 60_000;
+      // Superseded clear marker (a live limit exists for the same key) — must be dropped.
+      account.rateLimitResetTimes["gemini-antigravity"] = now + 1_000_000;
+      account.rateLimitSetTimes["gemini-antigravity"] = now;
+      account.clearedQuotaKeys["gemini-antigravity"] = now;
+      // Dead set timestamp (no live limit for the key) — must be dropped.
+      account.rateLimitSetTimes["gemini-cli"] = now;
+      // A valid, current clear marker — must survive.
+      account.clearedQuotaKeys["gemini-cli"] = now;
+
+      const saveSpy = vi.mocked(storageModule.saveAccounts);
+      saveSpy.mockClear();
+      await manager.saveToDisk();
+
+      // In-memory maps were pruned in place.
+      expect(account.clearedQuotaKeys["claude"]).toBeUndefined();
+      expect(account.clearedQuotaKeys["gemini-antigravity"]).toBeUndefined();
+      expect(account.rateLimitSetTimes["gemini-cli"]).toBeUndefined();
+      // Live-limit set marker and the valid clear marker survive.
+      expect(account.rateLimitSetTimes["gemini-antigravity"]).toBe(now);
+      expect(account.clearedQuotaKeys["gemini-cli"]).toBe(now);
+
+      // The persisted snapshot reflects the pruned state.
+      const persisted = saveSpy.mock.calls[0]![0].accounts[0]!;
+      expect(persisted.clearedQuotaKeys).toEqual({ "gemini-cli": now });
+      expect(persisted.rateLimitSetTimes).toEqual({ "gemini-antigravity": now });
+    });
+
+    it("records the cleared generation (setAt) when a limit passively expires", async () => {
+      vi.useFakeTimers();
+      try {
+        const base = 1_000_000;
+        vi.setSystemTime(new Date(base));
+
+        const stored: AccountStorageV4 = {
+          version: 4,
+          accounts: [
+            { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+          ],
+          activeIndex: 0,
+        };
+        const manager = new AccountManager(undefined, stored);
+        const account = manager.getAccounts()[0]!;
+
+        // Limit set at `base` (this is the generation).
+        manager.markRateLimited(account, 1_000, "claude");
+        expect(account.rateLimitSetTimes["claude"]).toBe(base);
+
+        // Time advances past the reset → passive expiry records a tombstone.
+        vi.setSystemTime(new Date(base + 5_000));
+        // Any read path triggers clearExpiredRateLimits.
+        manager.getMinWaitTimeForFamily("claude");
+
+        const saveSpy = vi.mocked(storageModule.saveAccounts);
+        saveSpy.mockClear();
+        await manager.saveToDisk();
+
+        const persisted = saveSpy.mock.calls[0]![0].accounts[0]!;
+        expect(persisted.rateLimitResetTimes?.claude).toBeUndefined();
+        // The tombstone is versioned with the GENERATION it cleared (the original setAt),
+        // not merely the wall-clock time of expiry.
+        expect(persisted.clearedSetTimes?.claude).toBe(base);
+        expect(persisted.clearedQuotaKeys?.claude).toBe(base + 5_000);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

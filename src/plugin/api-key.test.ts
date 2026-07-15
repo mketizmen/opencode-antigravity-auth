@@ -40,26 +40,28 @@ describe("api-key agy sdk support", () => {
     resetPublicGeminiApiModelCatalogForTests();
   });
 
-  it("retries another API key for credential failures and temporary capacity responses", () => {
-    // Given: responses that make the current key unusable or temporarily unavailable
-    const retryableStatuses = [401, 403, 429, 503, 529];
+  it("retries another API key for credential failures, capacity, and transient 5xx responses", () => {
+    // Given: responses that make the current key unusable, temporarily unavailable,
+    // or that are transient upstream server errors (500/502/504) — none are terminal.
+    const retryableStatuses = [401, 403, 429, 500, 502, 503, 504, 529];
 
     // When: classifying each response status
     const retryable = retryableStatuses.map(isRetryableAgySdkCredentialStatus);
 
-    // Then: the credential loop can rotate to another configured key
-    expect(retryable).toEqual([true, true, true, true, true]);
+    // Then: the credential loop can rotate to another configured key (and the OAuth
+    // fallback guard sites can rotate to another account) instead of returning it.
+    expect(retryable).toEqual(retryableStatuses.map(() => true));
   });
 
   it("does not rotate API keys for request and model errors", () => {
-    // Given: errors unrelated to the selected credential
-    const nonRetryableStatuses = [400, 404];
+    // Given: errors unrelated to the selected credential (client/model errors).
+    const nonRetryableStatuses = [400, 404, 501];
 
     // When: classifying each response status
     const retryable = nonRetryableStatuses.map(isRetryableAgySdkCredentialStatus);
 
     // Then: the response remains visible to the caller
-    expect(retryable).toEqual([false, false]);
+    expect(retryable).toEqual([false, false, false]);
   });
 
   it("keeps image generation requests on Antigravity", () => {

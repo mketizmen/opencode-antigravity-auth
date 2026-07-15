@@ -267,6 +267,42 @@ describe("Signature Cache", () => {
     });
   });
 
+  describe("whole-session eviction", () => {
+    it("evicts an entire session whose newest entry is older than the TTL", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(0));
+
+      cacheSignature("stale-session", "text", "sig");
+      expect(getCachedSignature("stale-session", "text")).toBe("sig");
+
+      // Advance beyond TTL (1 hour = 3600000ms), then touch via a different session.
+      vi.setSystemTime(new Date(3600001));
+      cacheSignature("fresh-session", "text2", "sig2");
+
+      // The stale session's map should have been swept entirely.
+      expect(getCachedSignature("stale-session", "text")).toBeUndefined();
+      expect(getCachedSignature("fresh-session", "text2")).toBe("sig2");
+    });
+
+    it("caps the number of session maps, FIFO-evicting the oldest-touched", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(0));
+
+      // Create more sessions than the cap (50), staggering their touch times so
+      // the earliest sessions are the oldest-touched. Stay within the TTL window.
+      const total = 55;
+      for (let i = 0; i < total; i++) {
+        vi.setSystemTime(new Date(i * 1000));
+        cacheSignature(`session-${i}`, "text", `sig-${i}`);
+      }
+
+      // The oldest sessions should be evicted; the most recent 50 remain.
+      expect(getCachedSignature("session-0", "text")).toBeUndefined();
+      expect(getCachedSignature("session-4", "text")).toBeUndefined();
+      expect(getCachedSignature(`session-${total - 1}`, "text")).toBe(`sig-${total - 1}`);
+    });
+  });
+
   describe("cache eviction", () => {
     it("evicts entries when at capacity", () => {
       vi.useFakeTimers();

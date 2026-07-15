@@ -5,6 +5,7 @@ import {
   EMPTY_SCHEMA_PLACEHOLDER_NAME,
   EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION,
   SKIP_THOUGHT_SIGNATURE,
+  MIN_SIGNATURE_LENGTH,
 } from "../constants";
 import { processImageData } from "./image-saver";
 import type { GoogleSearchConfig } from "./transform/types";
@@ -651,14 +652,42 @@ function addEmptySchemaPlaceholder(schema: any): any {
 }
 
 /**
+ * Bounded memo cache for cleanJSONSchemaForAntigravity.
+ *
+ * Tool schemas are static per session but the cleaning pass runs ~11 recursive
+ * tree-walks; recomputing it on every request is pure waste. We key on the
+ * canonical JSON of the input schema (collision-free, unlike a numeric hash)
+ * and store a pristine deep clone. Callers mutate the returned object (e.g.
+ * request.ts sets `.type`/`.properties`), so we always hand out a fresh clone
+ * and never expose the cached copy directly.
+ */
+const SCHEMA_CLEAN_CACHE_MAX = 200;
+const schemaCleanCache = new Map<string, any>();
+
+/**
  * Cleans a JSON schema for Antigravity API compatibility.
  * Transforms unsupported features into description hints while preserving semantic information.
- * 
+ *
  * Ported from CLIProxyAPI's CleanJSONSchemaForAntigravity (gemini_schema.go)
  */
 export function cleanJSONSchemaForAntigravity(schema: any): any {
   if (!schema || typeof schema !== "object") {
     return schema;
+  }
+
+  let cacheKey: string | undefined;
+  try {
+    cacheKey = JSON.stringify(schema);
+  } catch {
+    // Circular or otherwise non-serializable schema - skip caching.
+    cacheKey = undefined;
+  }
+
+  if (cacheKey !== undefined) {
+    const cached = schemaCleanCache.get(cacheKey);
+    if (cached !== undefined) {
+      return structuredClone(cached);
+    }
   }
 
   let result = schema;
@@ -681,6 +710,18 @@ export function cleanJSONSchemaForAntigravity(schema: any): any {
 
   // Phase 4: Add placeholder for empty object schemas
   result = addEmptySchemaPlaceholder(result);
+
+  if (cacheKey !== undefined) {
+    // Store a pristine copy so later caller mutations can't corrupt the cache,
+    // and hand the freshly-computed object to the current caller.
+    schemaCleanCache.set(cacheKey, structuredClone(result));
+    if (schemaCleanCache.size > SCHEMA_CLEAN_CACHE_MAX) {
+      const oldestKey = schemaCleanCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        schemaCleanCache.delete(oldestKey);
+      }
+    }
+  }
 
   return result;
 }
@@ -863,8 +904,6 @@ export function extractVariantThinkingConfig(
 export function resolveThinkingConfig(
   userConfig: ThinkingConfig | undefined,
   isThinkingModel: boolean,
-  _isClaudeModel: boolean,
-  _hasAssistantHistory: boolean,
 ): ThinkingConfig | undefined {
   // For thinking-capable models (including Claude thinking models), enable thinking by default
   // The signature validation/restoration is handled by filterUnsignedThinkingBlocks
@@ -961,7 +1000,7 @@ function removeTrailingThinkingBlocks(
  */
 function hasValidSignature(part: Record<string, unknown>): boolean {
   const signature = part.thought === true ? part.thoughtSignature : part.signature;
-  return typeof signature === "string" && signature.length >= 50;
+  return typeof signature === "string" && signature.length >= MIN_SIGNATURE_LENGTH;
 }
 
 /**
@@ -1002,8 +1041,18 @@ function isOurCachedSignature(
 
 /**
  * Gets the text content from a thinking part.
+ *
+ * This is the single canonical thinking-text extractor used by BOTH the
+ * request-helpers filtering path and request.ts signature caching/restoration.
+ * It unwraps nested object shapes ({ text: { text: "..." } } and
+ * { thinking: { text | thinking: "..." } }) that SDKs sometimes produce.
+ * Both call sites MUST use this helper so signature-cache lookups (which key
+ * on the extracted text) never miss on a nested part and silently fall back
+ * to the skip sentinel — which would reintroduce the Gemini-3 re-plan loop.
  */
-function getThinkingText(part: Record<string, unknown>): string {
+export function getThinkingText(part: any): string {
+  if (!part || typeof part !== "object") return "";
+
   if (typeof part.text === "string") return part.text;
   if (typeof part.thinking === "string") return part.thinking;
 
@@ -1158,6 +1207,11 @@ function filterContentArray(
       continue;
     }
 
+    // Claude path (the only path used in production - both deepFilterThinkingBlocks
+    // callers guard on `if (isClaude)` and pass isClaudeModel=true): replace EVERY
+    // thinking/signature part with a skip-sentinel block. This is the proven-working
+    // path, so it intentionally short-circuits before the cached-signature-restore
+    // blocks below.
     if (isClaudeModel && (isThinking || hasSignature)) {
       const thinkingText = getThinkingText(item) || "";
       const sentinelPart = {
@@ -1169,6 +1223,11 @@ function filterContentArray(
       continue;
     }
 
+    // Non-Claude path (isClaudeModel falsy): restore/validate cached signatures.
+    // Unreachable when isClaudeModel is true (the sentinel branch above handles
+    // those), but reachable and covered by tests for the exported utilities used
+    // with Gemini-style thought parts, so it is kept intentionally.
+    //
     // For the LAST assistant message with thinking blocks:
     // - If signature is OUR cached signature, pass through unchanged
     // - Otherwise inject sentinel to bypass Antigravity validation
@@ -1206,7 +1265,7 @@ function filterContentArray(
       const text = getThinkingText(item);
       if (text) {
         const cachedSignature = getCachedSignatureFn(sessionId, text);
-        if (cachedSignature && cachedSignature.length >= 50) {
+        if (cachedSignature && cachedSignature.length >= MIN_SIGNATURE_LENGTH) {
           const restoredPart = { ...item };
           if ((item as any).thought === true) {
             (restoredPart as any).thoughtSignature = cachedSignature;
@@ -1460,7 +1519,7 @@ function transformGeminiCandidate(candidate: any): any {
       };
     }
 
-    // Handle image data (inlineData) - save to disk and return file path
+    // Handle image data (inlineData) - save to disk (durable, synchronous) and return file path
     if (part.inlineData) {
       const result = processImageData({
         mimeType: part.inlineData.mimeType,

@@ -200,6 +200,16 @@ export const EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION = "Placeholder. Always pass tr
  */
 export const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
 
+/**
+ * Minimum length for a thought signature to be considered valid.
+ *
+ * Real Antigravity/Claude signatures are long base64-ish strings; anything
+ * shorter than this is treated as missing/invalid so signature restoration or
+ * the skip sentinel can take over. Shared across request.ts and
+ * request-helpers.ts to keep the validity threshold consistent.
+ */
+export const MIN_SIGNATURE_LENGTH = 50;
+
 // ============================================================================
 // ANTIGRAVITY SYSTEM INSTRUCTION (Ported from CLIProxyAPI v6.6.89)
 // ============================================================================

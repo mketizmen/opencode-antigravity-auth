@@ -80,11 +80,60 @@ interface SignatureEntry {
 // Map: sessionId -> Map<textHash, SignatureEntry>
 const signatureCache = new Map<string, Map<string, SignatureEntry>>();
 
+// Tracks the last write/access time per session for whole-session lifecycle
+// eviction. Kept in sync with signatureCache on every mutation.
+const sessionLastTouched = new Map<string, number>();
+
 // Cache entries expire after 1 hour
 const SIGNATURE_CACHE_TTL_MS = 60 * 60 * 1000;
 
 // Maximum entries per session to prevent memory bloat
 const MAX_ENTRIES_PER_SESSION = 100;
+
+// Maximum number of concurrent session maps to retain. Sessions never call an
+// explicit teardown, so we cap the count and FIFO-evict the oldest-touched
+// sessions to prevent unbounded growth from many short-lived sessions.
+const MAX_SESSIONS = 50;
+
+/**
+ * Delete a session's memory cache and its lifecycle bookkeeping together.
+ */
+function dropSession(sessionId: string): void {
+  signatureCache.delete(sessionId);
+  sessionLastTouched.delete(sessionId);
+}
+
+/**
+ * Record that a session was just written to or read from.
+ */
+function touchSession(sessionId: string, now: number): void {
+  sessionLastTouched.set(sessionId, now);
+}
+
+/**
+ * Opportunistically evict whole sessions:
+ * 1. Drop sessions whose newest entry is older than the TTL.
+ * 2. Cap the total number of sessions, FIFO-evicting the oldest-touched.
+ * Runs on each cacheSignature/getCachedSignature call; O(sessions) and cheap.
+ */
+function evictStaleSessions(now: number): void {
+  for (const [sessionId, touched] of sessionLastTouched) {
+    if (now - touched > SIGNATURE_CACHE_TTL_MS) {
+      dropSession(sessionId);
+    }
+  }
+
+  if (signatureCache.size > MAX_SESSIONS) {
+    const ordered = Array.from(sessionLastTouched.entries()).sort((a, b) => a[1] - b[1]);
+    const removeCount = signatureCache.size - MAX_SESSIONS;
+    for (let i = 0; i < removeCount && i < ordered.length; i++) {
+      const entry = ordered[i];
+      if (entry) {
+        dropSession(entry[0]);
+      }
+    }
+  }
+}
 
 // 16 hex chars = 64-bit key space; keeps memory bounded while making collisions extremely unlikely.
 const SIGNATURE_TEXT_HASH_HEX_LEN = 16;
@@ -132,6 +181,10 @@ function makeDiskKey(sessionId: string, textHash: string): string {
 export function cacheSignature(sessionId: string, text: string, signature: string): void {
   if (!sessionId || !text || !signature) return;
 
+  const now = Date.now();
+  // Opportunistically evict whole sessions that have gone stale before adding more.
+  evictStaleSessions(now);
+
   const textHash = hashText(text);
 
   // Write to memory cache
@@ -160,7 +213,11 @@ export function cacheSignature(sessionId: string, text: string, signature: strin
     }
   }
 
-  sessionMemCache.set(textHash, { signature, timestamp: Date.now() });
+  sessionMemCache.set(textHash, { signature, timestamp: now });
+  touchSession(sessionId, now);
+
+  // Enforce the session cap now that a (possibly new) session was written.
+  evictStaleSessions(now);
 
   // Write to disk cache if enabled
   if (diskCache) {
@@ -177,6 +234,10 @@ export function cacheSignature(sessionId: string, text: string, signature: strin
 export function getCachedSignature(sessionId: string, text: string): string | undefined {
   if (!sessionId || !text) return undefined;
 
+  const now = Date.now();
+  // Opportunistically sweep stale sessions on access.
+  evictStaleSessions(now);
+
   const textHash = hashText(text);
 
   // Check memory cache first
@@ -185,9 +246,10 @@ export function getCachedSignature(sessionId: string, text: string): string | un
     const entry = sessionMemCache.get(textHash);
     if (entry) {
       // Check if expired
-      if (Date.now() - entry.timestamp > SIGNATURE_CACHE_TTL_MS) {
+      if (now - entry.timestamp > SIGNATURE_CACHE_TTL_MS) {
         sessionMemCache.delete(textHash);
       } else {
+        touchSession(sessionId, now);
         return entry.signature;
       }
     }
@@ -204,7 +266,10 @@ export function getCachedSignature(sessionId: string, text: string): string | un
         memCache = new Map();
         signatureCache.set(sessionId, memCache);
       }
-      memCache.set(textHash, { signature: diskValue, timestamp: Date.now() });
+      memCache.set(textHash, { signature: diskValue, timestamp: now });
+      touchSession(sessionId, now);
+      // A promote may have added a new session; keep the cap enforced.
+      evictStaleSessions(now);
       return diskValue;
     }
   }
@@ -218,11 +283,12 @@ export function getCachedSignature(sessionId: string, text: string): string | un
  */
 export function clearSignatureCache(sessionId?: string): void {
   if (sessionId) {
-    signatureCache.delete(sessionId);
+    dropSession(sessionId);
     // Note: We don't clear individual sessions from disk cache to avoid
     // expensive iteration. Disk cache entries will expire naturally.
   } else {
     signatureCache.clear();
+    sessionLastTouched.clear();
     // For full clear, we could clear disk cache, but leaving it for now
     // since entries have TTL and will expire naturally.
   }

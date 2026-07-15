@@ -36,6 +36,15 @@ const UNKNOWN_BACKOFF = 60_000;
 const MIN_BACKOFF_MS = 2_000;
 
 /**
+ * How long a per-key rate-limit clear marker stays authoritative. After this
+ * window the marker is pruned so clearedQuotaKeys cannot grow unbounded and a
+ * very stale clear can no longer wipe a limit legitimately written elsewhere.
+ * Comfortably longer than the debounced-save window (seconds), so multi-instance
+ * syncs always observe the clear.
+ */
+export const RATE_LIMIT_CLEAR_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
  * Generate a random jitter value for backoff timing.
  * Helps prevent thundering herd problem when multiple clients retry simultaneously.
  */
@@ -135,6 +144,28 @@ export interface ManagedAccount {
   expires?: number;
   enabled: boolean;
   rateLimitResetTimes: RateLimitStateV3;
+  /**
+   * Per-quota-key SET timestamps (key -> setAt epoch ms), recorded whenever a limit
+   * is written. Lets the merge resolve conflicts by MUTATION ORDER (compare setAt vs
+   * clearedAt — latest wins) instead of by writer direction. The reset time cannot
+   * establish order because it is a future timestamp.
+   */
+  rateLimitSetTimes: Record<string, number>;
+  /**
+   * Per-quota-key clear markers (key -> clearedAt epoch ms). Records that a rate
+   * limit for a given pool was intentionally removed in memory, so a per-key merge
+   * with on-disk state can drop the stale limit instead of resurrecting it. A full
+   * snapshot alone cannot distinguish "untouched" from "cleared".
+   */
+  clearedQuotaKeys: Record<string, number>;
+  /**
+   * Per-quota-key GENERATION a tombstone cleared (key -> the cleared limit's setAt).
+   * A clear only supersedes a limit of that generation OR OLDER. This prevents a
+   * stale process that passively expires an OLD limit (recording clearedAt=now) from
+   * erasing a NEWER limit another process wrote in the meantime — the newer limit has
+   * a setAt greater than what this tombstone cleared, so the limit wins.
+   */
+  clearedSetTimes: Record<string, number>;
   lastSwitchReason?: "rate-limit" | "initial" | "rotation";
   coolingDownUntil?: number;
   cooldownReason?: CooldownReason;
@@ -220,8 +251,102 @@ function clearExpiredRateLimits(account: ManagedAccount): void {
     const resetTime = account.rateLimitResetTimes[key];
     if (resetTime !== undefined && now >= resetTime) {
       delete account.rateLimitResetTimes[key];
+      recordClearedQuotaKey(account, key, now);
     }
   }
+}
+
+/**
+ * Record that a quota key was cleared in memory. The marker is persisted in the
+ * snapshot so mergeAccountStorage can drop the stale on-disk limit for this key
+ * rather than resurrecting it.
+ */
+function recordClearedQuotaKey(account: ManagedAccount, key: string, at: number = nowMs()): void {
+  // Version the tombstone with the generation (setAt) of the limit being cleared, so
+  // the merge only lets this clear supersede that generation or older — not a newer
+  // limit written elsewhere after this generation was set.
+  const clearedGeneration = account.rateLimitSetTimes[key];
+  account.clearedQuotaKeys[key] = at;
+  if (typeof clearedGeneration === "number" && Number.isFinite(clearedGeneration)) {
+    account.clearedSetTimes[key] = clearedGeneration;
+  } else {
+    delete account.clearedSetTimes[key];
+  }
+  // The set timestamp is meaningless once the limit is cleared; a fresh clear is the
+  // latest mutation for this key.
+  delete account.rateLimitSetTimes[key];
+}
+
+/**
+ * Validate and prune clear markers read from disk: keep only finite numeric
+ * timestamps within the TTL window. Guards against corrupt/foreign values and
+ * stops unbounded growth of stale markers.
+ */
+function sanitizeClearedQuotaKeys(raw: Record<string, number> | undefined): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!raw) {
+    return out;
+  }
+  const now = nowMs();
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      continue;
+    }
+    if (now - value > RATE_LIMIT_CLEAR_TTL_MS) {
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Validate set timestamps read from disk: keep only finite numeric values whose key
+ * still holds a live limit (bounds growth — a setAt for a key with no limit is dead).
+ */
+function sanitizeRateLimitSetTimes(
+  raw: Record<string, number> | undefined,
+  limits: RateLimitStateV3 | undefined,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!raw) {
+    return out;
+  }
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      continue;
+    }
+    if (!limits || limits[key] === undefined) {
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Validate tombstone generations read from disk: keep only finite numeric values whose
+ * key is an active tombstone (present in the sanitized clearedQuotaKeys). A generation
+ * for a key with no live tombstone is dead.
+ */
+function sanitizeClearedSetTimes(
+  raw: Record<string, number> | undefined,
+  cleared: Record<string, number>,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!raw) {
+    return out;
+  }
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      continue;
+    }
+    if (cleared[key] === undefined) {
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
 }
 
 /**
@@ -317,6 +442,9 @@ export class AccountManager {
   private saveTimeout: ReturnType<typeof setTimeout> | null = null;
   private savePromiseResolvers: Array<() => void> = [];
   private saveQueue: Promise<void> = Promise.resolve();
+  /** Tracks an in-flight disk write so flushSaveToDisk can await a write that has
+   * already started (savePending is cleared before the write settles). */
+  private activeSave: Promise<void> | null = null;
 
   static async loadFromDisk(authFallback?: OAuthAuthDetails): Promise<AccountManager> {
     const stored = await loadAccounts();
@@ -346,6 +474,8 @@ export class AccountManager {
             acc.refreshToken === authParts.refreshToken
           );
 
+          const clearedQuotaKeys = sanitizeClearedQuotaKeys(acc.clearedQuotaKeys);
+
           return {
             index,
             email: acc.email,
@@ -360,6 +490,9 @@ export class AccountManager {
             expires: matchesFallback ? authFallback?.expires : undefined,
             enabled: acc.enabled !== false,
             rateLimitResetTimes: acc.rateLimitResetTimes ?? {},
+            rateLimitSetTimes: sanitizeRateLimitSetTimes(acc.rateLimitSetTimes, acc.rateLimitResetTimes),
+            clearedQuotaKeys: clearedQuotaKeys,
+            clearedSetTimes: sanitizeClearedSetTimes(acc.clearedSetTimes, clearedQuotaKeys),
             lastSwitchReason: acc.lastSwitchReason,
             coolingDownUntil: acc.coolingDownUntil,
             cooldownReason: acc.cooldownReason,
@@ -408,31 +541,9 @@ export class AccountManager {
       return;
     }
 
-    // If we have stored accounts, check if we need to add the current auth
-    if (authFallback && this.accounts.length > 0) {
-      const authParts = parseRefreshParts(authFallback.refresh);
-      const hasMatching = this.accounts.some(acc => acc.parts.refreshToken === authParts.refreshToken);
-      if (!hasMatching && authParts.refreshToken) {
-        const now = nowMs();
-        const newAccount: ManagedAccount = {
-          index: this.accounts.length,
-          email: undefined,
-          addedAt: now,
-          lastUsed: 0,
-          parts: authParts,
-          access: authFallback.access,
-          expires: authFallback.expires,
-          enabled: true,
-          rateLimitResetTimes: {},
-          touchedForQuota: {},
-        };
-        this.accounts.push(newAccount);
-        // Update indices to include the new account
-        this.currentAccountIndexByFamily.claude = Math.min(this.currentAccountIndexByFamily.claude, this.accounts.length - 1);
-        this.currentAccountIndexByFamily.gemini = Math.min(this.currentAccountIndexByFamily.gemini, this.accounts.length - 1);
-      }
-    }
-
+    // Reaching here means `stored` was null/undefined (both stored branches above
+    // return unconditionally), so this.accounts is still the initial []. Fall back
+    // to seeding the pool from the provided auth details.
     if (authFallback) {
       const parts = parseRefreshParts(authFallback.refresh);
       if (parts.refreshToken) {
@@ -448,6 +559,9 @@ export class AccountManager {
             expires: authFallback.expires,
             enabled: true,
             rateLimitResetTimes: {},
+            rateLimitSetTimes: {},
+            clearedQuotaKeys: {},
+            clearedSetTimes: {},
             touchedForQuota: {},
           },
         ];
@@ -471,7 +585,14 @@ export class AccountManager {
   }
 
   getAccountsSnapshot(): ManagedAccount[] {
-    return this.accounts.map((a) => ({ ...a, parts: { ...a.parts }, rateLimitResetTimes: { ...a.rateLimitResetTimes } }));
+    return this.accounts.map((a) => ({
+      ...a,
+      parts: { ...a.parts },
+      rateLimitResetTimes: { ...a.rateLimitResetTimes },
+      rateLimitSetTimes: { ...a.rateLimitSetTimes },
+      clearedQuotaKeys: { ...a.clearedQuotaKeys },
+      clearedSetTimes: { ...a.clearedSetTimes },
+    }));
   }
 
   getCurrentAccountForFamily(family: ModelFamily): ManagedAccount | null {
@@ -484,11 +605,6 @@ export class AccountManager {
       }
     }
     return null;
-  }
-
-  markSwitched(account: ManagedAccount, reason: "rate-limit" | "initial" | "rotation", family: ModelFamily): void {
-    account.lastSwitchReason = reason;
-    this.currentAccountIndexByFamily[family] = account.index;
   }
 
   /**
@@ -541,7 +657,11 @@ export class AccountManager {
             index: acc.index,
             lastUsed: acc.lastUsed,
             healthScore: healthTracker.getScore(acc.index),
-            isRateLimited: isRateLimitedForFamily(acc, family, model) || 
+            // Use the style-aware check (consistent with round-robin and the sticky
+            // fallback). isRateLimitedForFamily is true only when BOTH header-style
+            // pools are exhausted, so hybrid could otherwise pick an account whose
+            // requested-style pool is exhausted while the other style still has room.
+            isRateLimited: isRateLimitedForHeaderStyle(acc, family, headerStyle, model) ||
                           isOverSoftQuotaThreshold(acc, family, headerStyle, softQuotaThresholdPercent, softQuotaCacheTtlMs, model),
             isCoolingDown: this.isAccountCoolingDown(acc),
           };
@@ -626,8 +746,12 @@ export class AccountManager {
     headerStyle: HeaderStyle = "antigravity",
     model?: string | null
   ): void {
+    const now = nowMs();
     const key = getQuotaKey(family, headerStyle, model);
-    account.rateLimitResetTimes[key] = nowMs() + retryAfterMs;
+    account.rateLimitResetTimes[key] = now + retryAfterMs;
+    // Record the mutation order and supersede any prior clear marker for this key.
+    account.rateLimitSetTimes[key] = now;
+    delete account.clearedQuotaKeys[key];
   }
 
   /**
@@ -665,7 +789,10 @@ export class AccountManager {
     const backoffMs = calculateBackoffMs(reason, failures - 1, retryAfterMs);
     const key = getQuotaKey(family, headerStyle, model);
     account.rateLimitResetTimes[key] = now + backoffMs;
-    
+    // Record the mutation order and supersede any prior clear marker for this key.
+    account.rateLimitSetTimes[key] = now;
+    delete account.clearedQuotaKeys[key];
+
     return backoffMs;
   }
 
@@ -676,14 +803,24 @@ export class AccountManager {
   }
 
   clearAllRateLimitsForFamily(family: ModelFamily, model?: string | null): void {
+    const now = nowMs();
     for (const account of this.accounts) {
       if (family === "claude") {
-        delete account.rateLimitResetTimes.claude;
+        if (account.rateLimitResetTimes.claude !== undefined) {
+          delete account.rateLimitResetTimes.claude;
+          recordClearedQuotaKey(account, "claude", now);
+        }
       } else {
         const antigravityKey = getQuotaKey(family, "antigravity", model);
         const cliKey = getQuotaKey(family, "gemini-cli", model);
-        delete account.rateLimitResetTimes[antigravityKey];
-        delete account.rateLimitResetTimes[cliKey];
+        if (account.rateLimitResetTimes[antigravityKey] !== undefined) {
+          delete account.rateLimitResetTimes[antigravityKey];
+          recordClearedQuotaKey(account, antigravityKey, now);
+        }
+        if (account.rateLimitResetTimes[cliKey] !== undefined) {
+          delete account.rateLimitResetTimes[cliKey];
+          recordClearedQuotaKey(account, cliKey, now);
+        }
       }
       account.consecutiveFailures = 0;
     }
@@ -1002,6 +1139,71 @@ export class AccountManager {
       : saveAccounts(storage));
   }
 
+  /**
+   * Build the persisted clearedQuotaKeys map for an account. Prunes IN PLACE (so a
+   * long-running process cannot accumulate markers forever): drops markers past the
+   * TTL and any key that currently holds a live limit (the limit is the newer signal
+   * and supersedes the clear). Returns undefined when empty so we do not bloat the
+   * file with empty objects.
+   */
+  private serializeClearedQuotaKeys(account: ManagedAccount): Record<string, number> | undefined {
+    const now = nowMs();
+    const out: Record<string, number> = {};
+    for (const key of Object.keys(account.clearedQuotaKeys)) {
+      const clearedAt = account.clearedQuotaKeys[key];
+      const invalid = typeof clearedAt !== "number" || !Number.isFinite(clearedAt);
+      const expired = !invalid && now - (clearedAt as number) > RATE_LIMIT_CLEAR_TTL_MS;
+      const superseded = account.rateLimitResetTimes[key as QuotaKey] !== undefined;
+      if (invalid || expired || superseded) {
+        delete account.clearedQuotaKeys[key];
+        // The generation marker is only meaningful while the tombstone is live.
+        delete account.clearedSetTimes[key];
+        continue;
+      }
+      out[key] = clearedAt as number;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
+  /**
+   * Build the persisted clearedSetTimes map (tombstone generations). Prunes IN PLACE:
+   * keeps a generation only while its key is a live tombstone. Returns undefined empty.
+   */
+  private serializeClearedSetTimes(account: ManagedAccount): Record<string, number> | undefined {
+    const out: Record<string, number> = {};
+    for (const key of Object.keys(account.clearedSetTimes)) {
+      const setGen = account.clearedSetTimes[key];
+      const invalid = typeof setGen !== "number" || !Number.isFinite(setGen);
+      const orphaned = account.clearedQuotaKeys[key] === undefined;
+      if (invalid || orphaned) {
+        delete account.clearedSetTimes[key];
+        continue;
+      }
+      out[key] = setGen as number;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
+  /**
+   * Build the persisted rateLimitSetTimes map for an account. Prunes IN PLACE: keeps
+   * a set timestamp only while its key still holds a live limit (once cleared the
+   * timestamp is dead). Returns undefined when empty.
+   */
+  private serializeRateLimitSetTimes(account: ManagedAccount): Record<string, number> | undefined {
+    const out: Record<string, number> = {};
+    for (const key of Object.keys(account.rateLimitSetTimes)) {
+      const setAt = account.rateLimitSetTimes[key];
+      const invalid = typeof setAt !== "number" || !Number.isFinite(setAt);
+      const hasLiveLimit = account.rateLimitResetTimes[key as QuotaKey] !== undefined;
+      if (invalid || !hasLiveLimit) {
+        delete account.rateLimitSetTimes[key];
+        continue;
+      }
+      out[key] = setAt as number;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
   private createStorageSnapshot(): AccountStorageV4 {
     const claudeIndex = Math.max(0, this.currentAccountIndexByFamily.claude);
     const geminiIndex = Math.max(0, this.currentAccountIndexByFamily.gemini);
@@ -1015,8 +1217,16 @@ export class AccountManager {
         addedAt: a.addedAt,
         lastUsed: a.lastUsed,
         enabled: a.enabled,
-        lastSwitchReason: a.lastSwitchReason,
-        rateLimitResetTimes: Object.keys(a.rateLimitResetTimes).length > 0 ? a.rateLimitResetTimes : undefined,
+        rateLimitResetTimes: { ...a.rateLimitResetTimes },
+        // Emit per-key SET timestamps and clear markers so mergeAccountStorage can
+        // resolve conflicts by mutation order (latest setAt vs clearedAt wins),
+        // preventing a stale writer from resurrecting a cleared limit or erasing a
+        // newer re-limit, while still preserving concurrent updates to OTHER pools.
+        rateLimitSetTimes: this.serializeRateLimitSetTimes(a),
+        // serializeClearedQuotaKeys prunes tombstones (and their generation markers)
+        // first, so serializeClearedSetTimes only emits generations for live tombstones.
+        clearedQuotaKeys: this.serializeClearedQuotaKeys(a),
+        clearedSetTimes: this.serializeClearedSetTimes(a),
         coolingDownUntil: a.coolingDownUntil,
         cooldownReason: a.cooldownReason,
         fingerprint: a.fingerprint,
@@ -1083,23 +1293,41 @@ export class AccountManager {
   }
 
   async flushSaveToDisk(): Promise<void> {
-    if (!this.savePending) {
-      return;
+    // Drain until there is neither a pending (debounced) save waiting to fire nor
+    // an in-flight write. Re-check after every await: completing one save can leave
+    // a NEWER debounced save still pending (executeSave clears savePending before
+    // awaiting saveToDisk, so a fresh requestSaveToDisk can schedule another timer),
+    // and a write may still be in flight even when savePending is already false.
+    while (this.savePending || this.activeSave) {
+      if (this.savePending) {
+        await new Promise<void>((resolve) => {
+          this.savePromiseResolvers.push(resolve);
+        });
+      } else if (this.activeSave) {
+        await this.activeSave;
+      }
     }
-    return new Promise<void>((resolve) => {
-      this.savePromiseResolvers.push(resolve);
-    });
   }
 
   private async executeSave(): Promise<void> {
     this.savePending = false;
     this.saveTimeout = null;
-    
+
+    const savePromise = (async () => {
+      try {
+        await this.saveToDisk();
+      } catch {
+        // best-effort persistence; avoid unhandled rejection from timer-driven saves
+      }
+    })();
+    this.activeSave = savePromise;
+
     try {
-      await this.saveToDisk();
-    } catch {
-      // best-effort persistence; avoid unhandled rejection from timer-driven saves
+      await savePromise;
     } finally {
+      if (this.activeSave === savePromise) {
+        this.activeSave = null;
+      }
       this.resolveSavePromises();
     }
   }

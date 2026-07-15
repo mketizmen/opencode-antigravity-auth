@@ -7,6 +7,32 @@ import type {
 import { processImageData } from '../../image-saver';
 
 /**
+ * Upper bound on the number of thinking-text hashes retained per session.
+ *
+ * The per-session dedup Set is created (and its lifetime bounded) by
+ * request.ts, but WITHIN a long-lived session the Set would otherwise grow for
+ * every unique thinking chunk streamed. Cap it and FIFO-evict the oldest hash
+ * (a Set iterates in insertion order, so the first entry is the oldest). 2000
+ * hashes is far more than any single streamed turn produces, so dedup accuracy
+ * for the active turn is unaffected.
+ */
+const MAX_SESSION_THINKING_HASHES = 2000;
+
+/**
+ * Adds a hash to a bounded per-session dedup Set, evicting the oldest entry
+ * (insertion order) once the cap is exceeded.
+ */
+function addBoundedThinkingHash(hashes: Set<string>, hash: string): void {
+  hashes.add(hash);
+  if (hashes.size > MAX_SESSION_THINKING_HASHES) {
+    const oldest = hashes.values().next().value;
+    if (oldest !== undefined) {
+      hashes.delete(oldest);
+    }
+  }
+}
+
+/**
  * Simple string hash for thinking deduplication.
  * Uses DJB2-like algorithm.
  */
@@ -74,8 +100,8 @@ export function deduplicateThinkingText(
 
       const newParts = content.parts.map((part: unknown) => {
         const p = part as Record<string, unknown>;
-        
-        // Handle image data - save to disk and return file path
+
+        // Handle image data - save to disk (durable, synchronous) and return file path
         if (p.inlineData) {
           const inlineData = p.inlineData as Record<string, unknown>;
           const result = processImageData({
@@ -86,7 +112,7 @@ export function deduplicateThinkingText(
             return { text: result };
           }
         }
-        
+
         if (p.thought === true || p.type === 'thinking') {
           const fullText = (p.text || p.thinking || '') as string;
           
@@ -96,7 +122,7 @@ export function deduplicateThinkingText(
               sentBuffer.set(index, fullText);
               return null;
             }
-            displayedThinkingHashes.add(hash);
+            addBoundedThinkingHash(displayedThinkingHashes, hash);
           }
 
           const sentText = sentBuffer.get(index) ?? '';
@@ -142,7 +168,7 @@ export function deduplicateThinkingText(
             thinkingIndex++;
             return null;
           }
-          displayedThinkingHashes.add(hash);
+          addBoundedThinkingHash(displayedThinkingHashes, hash);
         }
 
         const sentText = sentBuffer.get(thinkingIndex) ?? '';

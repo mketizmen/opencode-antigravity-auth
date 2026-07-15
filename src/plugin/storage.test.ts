@@ -709,3 +709,577 @@ describe("Storage Migration", () => {
     });
   });
 });
+
+describe("saveAccounts merge — cleared rate limits are not resurrected", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function mockDisk(existing: AccountStorageV4): void {
+    vi.mocked(fs.readFile).mockImplementation((path) => {
+      if ((path as string).endsWith(".gitignore")) {
+        const error = new Error("ENOENT") as NodeJS.ErrnoException;
+        error.code = "ENOENT";
+        return Promise.reject(error);
+      }
+      return Promise.resolve(JSON.stringify(existing));
+    });
+    vi.mocked(fs.writeFile).mockResolvedValue(undefined);
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
+  }
+
+  function readMergedSnapshot(): AccountStorageV4 {
+    const tmpCall = vi.mocked(fs.writeFile).mock.calls.find(
+      (call) => (call[0] as string).includes(".tmp"),
+    );
+    if (!tmpCall) throw new Error("atomic write (tmp file) not found");
+    return JSON.parse(tmpCall[1] as string) as AccountStorageV4;
+  }
+
+  it("does not re-merge a rate-limit key that was cleared in the incoming snapshot", async () => {
+    // On disk: account r1 is rate-limited for claude.
+    mockDisk({
+      version: 4,
+      accounts: [
+        {
+          email: "a@example.com",
+          refreshToken: "r1",
+          addedAt: 1,
+          lastUsed: 5,
+          rateLimitResetTimes: { claude: 9_999_999_999_999 },
+        },
+      ],
+      activeIndex: 0,
+    });
+
+    // Incoming snapshot: same account, claude limit CLEARED. The snapshot carries an
+    // explicit clearedQuotaKeys marker so the merge drops the stale on-disk value.
+    await saveAccounts({
+      version: 4,
+      accounts: [
+        {
+          email: "a@example.com",
+          refreshToken: "r1",
+          addedAt: 1,
+          lastUsed: 6,
+          rateLimitResetTimes: {},
+          clearedQuotaKeys: { claude: Date.now() },
+        },
+      ],
+      activeIndex: 0,
+    });
+
+    const merged = readMergedSnapshot();
+    expect(merged.accounts).toHaveLength(1);
+    // The cleared limit must NOT be resurrected from disk.
+    expect(merged.accounts[0]?.rateLimitResetTimes?.claude).toBeUndefined();
+  });
+
+  it("preserves a concurrent per-pool update on the same account (no whole-object loss)", async () => {
+    // On disk: instance A already recorded a claude limit for this account.
+    mockDisk({
+      version: 4,
+      accounts: [
+        {
+          email: "a@example.com",
+          refreshToken: "r1",
+          addedAt: 1,
+          lastUsed: 5,
+          rateLimitResetTimes: { claude: 9_999_999_999_999 },
+        },
+      ],
+      activeIndex: 0,
+    });
+
+    // Incoming: a stale instance B writes a DIFFERENT pool (gemini-antigravity) and
+    // never touched claude (no claude limit, no claude clear marker). A whole-object
+    // replace would delete A's claude limit; the per-key union must keep both.
+    await saveAccounts({
+      version: 4,
+      accounts: [
+        {
+          email: "a@example.com",
+          refreshToken: "r1",
+          addedAt: 1,
+          lastUsed: 6,
+          rateLimitResetTimes: { "gemini-antigravity": 8_888_888_888_888 },
+        },
+      ],
+      activeIndex: 0,
+    });
+
+    const merged = readMergedSnapshot();
+    expect(merged.accounts[0]?.rateLimitResetTimes).toEqual({
+      claude: 9_999_999_999_999,
+      "gemini-antigravity": 8_888_888_888_888,
+    });
+  });
+
+  it("a re-set limit supersedes a clear marker for the same key", async () => {
+    mockDisk({
+      version: 4,
+      accounts: [
+        {
+          email: "a@example.com",
+          refreshToken: "r1",
+          addedAt: 1,
+          lastUsed: 5,
+          // Disk still remembers an old clear for claude...
+          clearedQuotaKeys: { claude: Date.now() - 1000 },
+        },
+      ],
+      activeIndex: 0,
+    });
+
+    // ...but the live writer has re-set a claude limit. The limit must win and the
+    // stale clear marker must not survive.
+    await saveAccounts({
+      version: 4,
+      accounts: [
+        {
+          email: "a@example.com",
+          refreshToken: "r1",
+          addedAt: 1,
+          lastUsed: 6,
+          rateLimitResetTimes: { claude: 7_777_777_777_777 },
+        },
+      ],
+      activeIndex: 0,
+    });
+
+    const merged = readMergedSnapshot();
+    expect(merged.accounts[0]?.rateLimitResetTimes?.claude).toBe(7_777_777_777_777);
+    expect(merged.accounts[0]?.clearedQuotaKeys?.claude).toBeUndefined();
+  });
+
+  it("falls back to the on-disk limits when incoming omits the field entirely", async () => {
+    // Foreign/older writer stored a limit on disk.
+    mockDisk({
+      version: 4,
+      accounts: [
+        {
+          email: "a@example.com",
+          refreshToken: "r1",
+          addedAt: 1,
+          lastUsed: 5,
+          rateLimitResetTimes: { claude: 9_999_999_999_999 },
+        },
+      ],
+      activeIndex: 0,
+    });
+
+    // Incoming has NO rateLimitResetTimes (undefined) — should not wipe disk state.
+    await saveAccounts({
+      version: 4,
+      accounts: [
+        { email: "a@example.com", refreshToken: "r1", addedAt: 1, lastUsed: 6 },
+      ],
+      activeIndex: 0,
+    });
+
+    const merged = readMergedSnapshot();
+    expect(merged.accounts[0]?.rateLimitResetTimes).toEqual({
+      claude: 9_999_999_999_999,
+    });
+  });
+
+  it("still unions accounts from the in-memory snapshot and disk", async () => {
+    mockDisk({
+      version: 4,
+      accounts: [
+        { email: "disk@example.com", refreshToken: "disk", addedAt: 1, lastUsed: 5 },
+      ],
+      activeIndex: 0,
+    });
+
+    await saveAccounts({
+      version: 4,
+      accounts: [
+        {
+          email: "mem@example.com",
+          refreshToken: "mem",
+          addedAt: 2,
+          lastUsed: 6,
+          rateLimitResetTimes: {},
+        },
+      ],
+      activeIndex: 0,
+    });
+
+    const merged = readMergedSnapshot();
+    const tokens = merged.accounts.map((a) => a.refreshToken).sort();
+    expect(tokens).toEqual(["disk", "mem"]);
+  });
+
+  describe("conflicts resolve by mutation order (setAt vs clearedAt)", () => {
+    const nowTs = Date.now();
+    const FUTURE = nowTs + 1_000_000_000;
+    const T_OLD = nowTs - 20_000;
+    const T_NEW = nowTs - 1_000;
+    const TTL_MS = 24 * 60 * 60 * 1000;
+
+    it("a stale incoming CLEAR does not erase a NEWER re-limit on disk", async () => {
+      // Disk: account was re-limited recently (setAt = T_NEW).
+      mockDisk({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 5,
+            rateLimitResetTimes: { claude: FUTURE },
+            rateLimitSetTimes: { claude: T_NEW },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      // Incoming: a delayed writer that cleared claude EARLIER (clearedAt = T_OLD).
+      await saveAccounts({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 6,
+            rateLimitResetTimes: {},
+            clearedQuotaKeys: { claude: T_OLD },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      const merged = readMergedSnapshot();
+      // Newer set beats older clear → the re-limit survives.
+      expect(merged.accounts[0]?.rateLimitResetTimes?.claude).toBe(FUTURE);
+      expect(merged.accounts[0]?.clearedQuotaKeys?.claude).toBeUndefined();
+    });
+
+    it("a stale incoming SET does not resurrect an OLDER cleared limit on disk", async () => {
+      // Disk: claude was cleared recently (clearedAt = T_NEW), and that tombstone cleared
+      // generation T_OLD — the very generation the stale writer below still holds.
+      mockDisk({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 5,
+            clearedQuotaKeys: { claude: T_NEW },
+            clearedSetTimes: { claude: T_OLD },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      // Incoming: a delayed writer whose claude limit was set EARLIER (setAt = T_OLD).
+      await saveAccounts({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 6,
+            rateLimitResetTimes: { claude: FUTURE },
+            rateLimitSetTimes: { claude: T_OLD },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      const merged = readMergedSnapshot();
+      // Newer clear beats older set → the stale limit is NOT resurrected.
+      expect(merged.accounts[0]?.rateLimitResetTimes?.claude).toBeUndefined();
+      expect(merged.accounts[0]?.clearedQuotaKeys?.claude).toBe(T_NEW);
+    });
+
+    it("a NEWER incoming clear beats an older disk set (same generation)", async () => {
+      mockDisk({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 5,
+            rateLimitResetTimes: { claude: FUTURE },
+            rateLimitSetTimes: { claude: T_OLD },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      // Incoming cleared exactly the generation on disk (clearedSetAt = T_OLD).
+      await saveAccounts({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 6,
+            rateLimitResetTimes: {},
+            clearedQuotaKeys: { claude: T_NEW },
+            clearedSetTimes: { claude: T_OLD },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      const merged = readMergedSnapshot();
+      expect(merged.accounts[0]?.rateLimitResetTimes?.claude).toBeUndefined();
+      expect(merged.accounts[0]?.clearedQuotaKeys?.claude).toBe(T_NEW);
+    });
+
+    it("an EXPIRED incoming tombstone does not delete a live disk limit (TTL filtered once)", async () => {
+      mockDisk({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 5,
+            rateLimitResetTimes: { claude: FUTURE },
+            rateLimitSetTimes: { claude: T_OLD },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      // Incoming tombstone is older than the TTL → must be ignored entirely.
+      await saveAccounts({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 6,
+            rateLimitResetTimes: {},
+            clearedQuotaKeys: { claude: nowTs - TTL_MS - 60_000 },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      const merged = readMergedSnapshot();
+      // Live limit preserved; the expired tombstone neither deletes it nor is re-persisted.
+      expect(merged.accounts[0]?.rateLimitResetTimes?.claude).toBe(FUTURE);
+      expect(merged.accounts[0]?.clearedQuotaKeys?.claude).toBeUndefined();
+    });
+
+    it("passive expiry in a stale process does not erase a newer limit (generation-versioned tombstone)", async () => {
+      // Interleaving:
+      //  - Process B held an OLD claude limit set at T_OLD.
+      //  - Process A wrote a NEWER claude limit set at T_NEW (T_OLD < T_NEW), now on disk.
+      //  - Process B only now notices its OLD limit expired and records a tombstone with
+      //    clearedAt = FRESH (later than T_NEW) but that cleared GENERATION T_OLD.
+      const FRESH = nowTs; // clearedAt is later than the newer set — would win under naive ordering.
+      mockDisk({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 5,
+            rateLimitResetTimes: { claude: FUTURE },
+            rateLimitSetTimes: { claude: T_NEW },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      await saveAccounts({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 6,
+            rateLimitResetTimes: {},
+            clearedQuotaKeys: { claude: FRESH },
+            clearedSetTimes: { claude: T_OLD },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      const merged = readMergedSnapshot();
+      // The tombstone only cleared generation T_OLD; the newer T_NEW limit survives even
+      // though its clearedAt is later.
+      expect(merged.accounts[0]?.rateLimitResetTimes?.claude).toBe(FUTURE);
+      expect(merged.accounts[0]?.clearedQuotaKeys?.claude).toBeUndefined();
+    });
+
+    it("a tombstone still supersedes the generation it actually cleared", async () => {
+      // Disk holds the very generation (T_OLD) that the incoming tombstone cleared.
+      mockDisk({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 5,
+            rateLimitResetTimes: { claude: FUTURE },
+            rateLimitSetTimes: { claude: T_OLD },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      await saveAccounts({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 6,
+            rateLimitResetTimes: {},
+            clearedQuotaKeys: { claude: T_NEW },
+            clearedSetTimes: { claude: T_OLD },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      const merged = readMergedSnapshot();
+      // setAt (T_OLD) <= clearedSetAt (T_OLD) → the clear wins, limit removed.
+      expect(merged.accounts[0]?.rateLimitResetTimes?.claude).toBeUndefined();
+      expect(merged.accounts[0]?.clearedQuotaKeys?.claude).toBe(T_NEW);
+    });
+
+    it("a legacy no-setAt disk limit does not override a newer incoming set (SET-vs-SET fallback)", async () => {
+      // Legacy disk: a claude limit with a HIGHER reset but NO set timestamp.
+      mockDisk({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 5,
+            rateLimitResetTimes: { claude: 9_000_000_000_000 },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      // Incoming: a newer set with a valid setAt but a LOWER reset.
+      await saveAccounts({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 6,
+            rateLimitResetTimes: { claude: 5_000_000_000_000 },
+            rateLimitSetTimes: { claude: T_NEW },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      const merged = readMergedSnapshot();
+      // Incoming (versioned) wins despite its lower reset, and its setAt is carried
+      // forward so future merges stay orderable — not discarded.
+      expect(merged.accounts[0]?.rateLimitResetTimes?.claude).toBe(5_000_000_000_000);
+      expect(merged.accounts[0]?.rateLimitSetTimes?.claude).toBe(T_NEW);
+    });
+
+    it("an unversioned CLEAR does not erase a versioned SET (legacy limit passively expired)", async () => {
+      // Concrete interleaving (Codex): A has a versioned limit on disk; B loaded a LEGACY
+      // limit (no setAt), then passively expired it producing an UNVERSIONED tombstone
+      // (clearedAt, no clearedSetAt). Timestamps are relative to now — a tombstone older
+      // than the 24h TTL would be filtered out before reaching the exactly-one-versioned
+      // branch, silently passing this test even if the branch regressed.
+      const NOW = Date.now();
+      const SET_AT = NOW - 60_000;
+      const CLEARED_AT = NOW - 30_000;
+      const RESET_AT = NOW + 3_600_000;
+      mockDisk({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 5,
+            rateLimitResetTimes: { claude: RESET_AT },
+            rateLimitSetTimes: { claude: SET_AT },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      await saveAccounts({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 6,
+            rateLimitResetTimes: {},
+            clearedQuotaKeys: { claude: CLEARED_AT },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      const merged = readMergedSnapshot();
+      // The unversioned clear can't prove it saw the SET_AT generation → A's versioned set survives.
+      expect(merged.accounts[0]?.rateLimitResetTimes?.claude).toBe(RESET_AT);
+      expect(merged.accounts[0]?.rateLimitSetTimes?.claude).toBe(SET_AT);
+      expect(merged.accounts[0]?.clearedQuotaKeys?.claude).toBeUndefined();
+    });
+
+    it("a versioned disk SET survives a legacy incoming SET (reverse orientation of the fallback)", async () => {
+      // Disk: A's versioned set {reset:1000, setAt:200}.
+      mockDisk({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 5,
+            rateLimitResetTimes: { claude: 1000 },
+            rateLimitSetTimes: { claude: 200 },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      // Incoming: a stale LEGACY writer with a different reset and NO setAt.
+      await saveAccounts({
+        version: 4,
+        accounts: [
+          {
+            email: "a@example.com",
+            refreshToken: "r1",
+            addedAt: 1,
+            lastUsed: 6,
+            rateLimitResetTimes: { claude: 250 },
+          },
+        ],
+        activeIndex: 0,
+      });
+
+      const merged = readMergedSnapshot();
+      // The VERSIONED disk set wins outright — reset AND setAt together, never mixed with
+      // the legacy incoming reset.
+      expect(merged.accounts[0]?.rateLimitResetTimes?.claude).toBe(1000);
+      expect(merged.accounts[0]?.rateLimitSetTimes?.claude).toBe(200);
+    });
+  });
+});

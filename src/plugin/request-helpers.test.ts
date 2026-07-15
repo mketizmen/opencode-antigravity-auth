@@ -23,6 +23,7 @@ import {
   cleanJSONSchemaForAntigravity,
   createSyntheticErrorResponse,
   recursivelyParseJsonStrings,
+  getThinkingText,
 } from "./request-helpers";
 import { deduplicateThinkingText, createThoughtBuffer } from "./core/streaming/transformer";
 
@@ -259,12 +260,10 @@ describe("extractThinkingConfig", () => {
 });
 
 describe("resolveThinkingConfig", () => {
-  it("keeps thinking enabled for Claude models with assistant history", () => {
+  it("keeps thinking enabled when a user config is supplied", () => {
     const result = resolveThinkingConfig(
       { includeThoughts: true, thinkingBudget: 8000 },
       true, // isThinkingModel
-      true, // isClaudeModel
-      true, // hasAssistantHistory
     );
     expect(result).toEqual({ includeThoughts: true, thinkingBudget: 8000 });
   });
@@ -273,30 +272,24 @@ describe("resolveThinkingConfig", () => {
     const result = resolveThinkingConfig(
       undefined,
       true, // isThinkingModel
-      false, // isClaudeModel
-      false, // hasAssistantHistory
     );
     expect(result).toEqual({ includeThoughts: true, thinkingBudget: DEFAULT_THINKING_BUDGET });
   });
 
-  it("respects user config for non-Claude models", () => {
+  it("respects user config for thinking models", () => {
     const userConfig = { includeThoughts: false, thinkingBudget: 5000 };
     const result = resolveThinkingConfig(
       userConfig,
       true,
-      false,
-      false,
     );
     expect(result).toEqual(userConfig);
   });
 
-  it("returns user config for Claude without history", () => {
+  it("returns the provided user config unchanged", () => {
     const userConfig = { includeThoughts: true, thinkingBudget: 8000 };
     const result = resolveThinkingConfig(
       userConfig,
       true,
-      true, // isClaudeModel
-      false, // no history
     );
     expect(result).toEqual(userConfig);
   });
@@ -305,8 +298,6 @@ describe("resolveThinkingConfig", () => {
     const result = resolveThinkingConfig(
       undefined,
       false, // not thinking model
-      false,
-      false,
     );
     expect(result).toBeUndefined();
   });
@@ -1769,7 +1760,7 @@ describe("deduplicateThinkingText", () => {
 
   it("extracts delta from accumulated Gemini thinking text", () => {
     const buffer = createTestBuffer();
-    
+
     const chunk1 = {
       candidates: [{
         content: {
@@ -1780,7 +1771,7 @@ describe("deduplicateThinkingText", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result1 = deduplicateThinkingText(chunk1, buffer) as any;
     expect(result1.candidates[0].content.parts[0].text).toBe("Hello ");
-    
+
     const chunk2 = {
       candidates: [{
         content: {
@@ -1795,7 +1786,7 @@ describe("deduplicateThinkingText", () => {
 
   it("filters out empty delta parts", () => {
     const buffer = createTestBuffer();
-    
+
     const chunk1 = {
       candidates: [{
         content: {
@@ -1804,7 +1795,7 @@ describe("deduplicateThinkingText", () => {
       }],
     };
     deduplicateThinkingText(chunk1, buffer);
-    
+
     const chunk2 = {
       candidates: [{
         content: {
@@ -1823,14 +1814,14 @@ describe("deduplicateThinkingText", () => {
 
   it("extracts delta from accumulated Claude thinking blocks", () => {
     const buffer = createTestBuffer();
-    
+
     const chunk1 = {
       content: [{ type: "thinking", thinking: "First " }],
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result1 = deduplicateThinkingText(chunk1, buffer) as any;
     expect(result1.content[0].thinking).toBe("First ");
-    
+
     const chunk2 = {
       content: [{ type: "thinking", thinking: "First part" }],
     };
@@ -1841,7 +1832,7 @@ describe("deduplicateThinkingText", () => {
 
   it("handles new thinking content that does not start with sent text", () => {
     const buffer = createTestBuffer();
-    
+
     const chunk1 = {
       candidates: [{
         content: {
@@ -1850,7 +1841,7 @@ describe("deduplicateThinkingText", () => {
       }],
     };
     deduplicateThinkingText(chunk1, buffer);
-    
+
     const chunk2 = {
       candidates: [{
         content: {
@@ -1865,7 +1856,7 @@ describe("deduplicateThinkingText", () => {
 
   it("preserves non-thinking parts unchanged", () => {
     const buffer = createTestBuffer();
-    
+
     const chunk = {
       candidates: [{
         content: {
@@ -1881,6 +1872,31 @@ describe("deduplicateThinkingText", () => {
     const result = deduplicateThinkingText(chunk, buffer) as any;
     expect(result.candidates[0].content.parts[1].text).toBe("Regular text");
     expect(result.candidates[0].content.parts[2].functionCall.name).toBe("test");
+  });
+
+  // Follow-up: per-session dedup Set must stay bounded within a long session,
+  // not just across sessions. Stream far more unique thoughts than the cap and
+  // assert the Set does not grow without bound (FIFO eviction of oldest hashes).
+  it("bounds the per-session displayedThinkingHashes Set (FIFO eviction)", () => {
+    const buffer = createTestBuffer();
+    const displayedThinkingHashes = new Set<string>();
+
+    // Each unique full text (buffer keyed by candidate index 0) produces a new
+    // hash. Stream 5000 distinct thoughts on fresh indices to force growth.
+    for (let i = 0; i < 5000; i++) {
+      const chunk = {
+        candidates: [{
+          content: {
+            parts: [{ thought: true, text: `unique-thought-${i}` }],
+          },
+        }],
+      };
+      deduplicateThinkingText(chunk, buffer, displayedThinkingHashes);
+    }
+
+    // Never exceeds the 2000-hash cap.
+    expect(displayedThinkingHashes.size).toBeLessThanOrEqual(2000);
+    expect(displayedThinkingHashes.size).toBeGreaterThan(0);
   });
 
 
@@ -1949,5 +1965,86 @@ describe("recursivelyParseJsonStrings", () => {
         },
       },
     });
+  });
+});
+
+describe("getThinkingText", () => {
+  it("returns a flat string text field", () => {
+    expect(getThinkingText({ thought: true, text: "flat thought" })).toBe("flat thought");
+  });
+
+  it("returns a flat string thinking field", () => {
+    expect(getThinkingText({ type: "thinking", thinking: "flat thinking" })).toBe("flat thinking");
+  });
+
+  // Regression: nested { text: { text } } shape must be unwrapped so the
+  // signature-cache lookup keyed on this text does not miss and fall back to
+  // the skip sentinel (which would reintroduce the Gemini-3 re-plan loop).
+  it("unwraps nested { text: { text } } shape", () => {
+    expect(
+      getThinkingText({ thought: true, text: { text: "nested thought", cache_control: { type: "ephemeral" } } }),
+    ).toBe("nested thought");
+  });
+
+  it("unwraps nested { thinking: { text } } shape", () => {
+    expect(getThinkingText({ type: "thinking", thinking: { text: "nested via text" } })).toBe("nested via text");
+  });
+
+  it("unwraps nested { thinking: { thinking } } shape", () => {
+    expect(getThinkingText({ type: "thinking", thinking: { thinking: "nested via thinking" } })).toBe(
+      "nested via thinking",
+    );
+  });
+
+  it("returns empty string for null/non-object parts", () => {
+    expect(getThinkingText(null)).toBe("");
+    expect(getThinkingText(undefined)).toBe("");
+    expect(getThinkingText("string")).toBe("");
+  });
+
+  it("returns empty string when no text/thinking field is present", () => {
+    expect(getThinkingText({ thought: true })).toBe("");
+  });
+});
+
+describe("cleanJSONSchemaForAntigravity memoization", () => {
+  it("returns an equal-but-distinct object for the same input (cache hit)", () => {
+    const schema = {
+      type: "object",
+      properties: { city: { type: "string" } },
+      required: ["city"],
+    };
+    const first = cleanJSONSchemaForAntigravity(schema);
+    const second = cleanJSONSchemaForAntigravity(structuredClone(schema));
+    expect(second).toEqual(first);
+    // Cache hands out a fresh clone so callers can mutate safely.
+    expect(second).not.toBe(first);
+  });
+
+  it("does not let caller mutations of a returned schema corrupt the cache", () => {
+    const schema = {
+      type: "object",
+      properties: { name: { type: "string" } },
+    };
+    const first = cleanJSONSchemaForAntigravity(schema);
+    // Simulate the request.ts caller mutating the cleaned result.
+    (first as any).type = "object";
+    (first as any).injectedByCaller = true;
+    (first as any).properties.extra = { type: "boolean" };
+
+    const second = cleanJSONSchemaForAntigravity(structuredClone(schema));
+    expect((second as any).injectedByCaller).toBeUndefined();
+    expect((second as any).properties.extra).toBeUndefined();
+  });
+
+  it("produces the same result whether or not the value was cached", () => {
+    const schema = {
+      type: "object",
+      properties: { flag: { const: "x" } },
+    };
+    const uncached = cleanJSONSchemaForAntigravity(structuredClone(schema));
+    // Second call for the identical shape should be served from cache.
+    const cached = cleanJSONSchemaForAntigravity(structuredClone(schema));
+    expect(cached).toEqual(uncached);
   });
 });
