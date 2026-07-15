@@ -88,17 +88,27 @@ import type {
 const MAX_OAUTH_ACCOUNTS = 10;
 const MAX_WARMUP_SESSIONS = 1000;
 const MAX_WARMUP_RETRIES = 2;
-const CAPACITY_BACKOFF_TIERS_MS = [5000, 10000, 20000, 30000, 60000];
-
-function getCapacityBackoffDelay(consecutiveFailures: number): number {
-  const index = Math.min(consecutiveFailures, CAPACITY_BACKOFF_TIERS_MS.length - 1);
-  return CAPACITY_BACKOFF_TIERS_MS[Math.max(0, index)] ?? 5000;
-}
-const warmupAttemptedSessionIds = new Set<string>();
+// Per-session warmup attempt counter. A plain Set can't enforce
+// MAX_WARMUP_RETRIES (membership is only 0/1), so the retry cap was dead.
+const warmupAttemptCounts = new Map<string, number>();
 const warmupSucceededSessionIds = new Set<string>();
 
-// Track if this plugin instance is running in a child session (subagent, background task)
-// Used to filter toasts based on toast_scope config
+// Track if this plugin instance is running in a child session (subagent, background task).
+// Used to filter toasts based on toast_scope config. These are a LAST-EVENT
+// heuristic set by the most recent session.created event.
+//
+// KNOWN LIMITATION (do not re-attempt per-request correlation): a single plugin
+// instance serves many concurrent sessions, so a subagent's session.created can
+// flip these globals while a root session's request is still in flight, briefly
+// mis-scoping a toast. This race cannot currently be closed from the fetch
+// interceptor because it has no access to the request's OpenCode session id —
+// the Gemini request payload/headers do not carry it, and `prepared.sessionId`
+// is a signature *cache* key (`${PLUGIN_SESSION_ID}:model:project:conversation`
+// from request.ts), NOT the `session.created` `info.id`. A prior attempt to key a
+// per-session parent map by `prepared.sessionId` could never match and was
+// removed as dead code. Closing the race requires a real correlation source
+// (OpenCode exposing the session id to the provider fetch, or a plugin API for
+// the active session).
 let isChildSession = false;
 let childSessionParentID: string | undefined = undefined;
 
@@ -407,35 +417,37 @@ function trackWarmupAttempt(sessionId: string): boolean {
   if (warmupSucceededSessionIds.has(sessionId)) {
     return false;
   }
-  if (warmupAttemptedSessionIds.size >= MAX_WARMUP_SESSIONS) {
-    const first = warmupAttemptedSessionIds.values().next().value;
-    if (first) {
-      warmupAttemptedSessionIds.delete(first);
-      warmupSucceededSessionIds.delete(first);
-    }
-  }
   const attempts = getWarmupAttemptCount(sessionId);
   if (attempts >= MAX_WARMUP_RETRIES) {
     return false;
   }
-  warmupAttemptedSessionIds.add(sessionId);
+  // Evict the oldest entry ONLY when inserting a brand-new session. Evicting
+  // before the has-check could delete the very session being retried (if it were
+  // the oldest), resetting its count to 0 and defeating the cap.
+  if (!warmupAttemptCounts.has(sessionId) && warmupAttemptCounts.size >= MAX_WARMUP_SESSIONS) {
+    const first = warmupAttemptCounts.keys().next().value;
+    if (first !== undefined) {
+      warmupAttemptCounts.delete(first);
+      warmupSucceededSessionIds.delete(first);
+    }
+  }
+  // Count this attempt up-front so failed attempts accrue toward the cap
+  // (previously the failure path cleared the record, so the cap never engaged).
+  warmupAttemptCounts.set(sessionId, attempts + 1);
   return true;
 }
 
 function getWarmupAttemptCount(sessionId: string): number {
-  return warmupAttemptedSessionIds.has(sessionId) ? 1 : 0;
+  return warmupAttemptCounts.get(sessionId) ?? 0;
 }
 
 function markWarmupSuccess(sessionId: string): void {
   warmupSucceededSessionIds.add(sessionId);
+  warmupAttemptCounts.delete(sessionId);
   if (warmupSucceededSessionIds.size >= MAX_WARMUP_SESSIONS) {
     const first = warmupSucceededSessionIds.values().next().value;
     if (first) warmupSucceededSessionIds.delete(first);
   }
-}
-
-function clearWarmupAttempt(sessionId: string): void {
-  warmupAttemptedSessionIds.delete(sessionId);
 }
 
 function isWSL(): boolean {
@@ -1404,21 +1416,37 @@ function resetRateLimitState(accountIndex: number, quotaKey: string): void {
   rateLimitStateByAccountQuota.delete(stateKey);
 }
 
-/**
- * Reset all rate limit state for an account (all quotas).
- * Used when account is completely healthy.
- */
-function resetAllRateLimitStateForAccount(accountIndex: number): void {
-  for (const key of rateLimitStateByAccountQuota.keys()) {
-    if (key.startsWith(`${accountIndex}:`)) {
-      rateLimitStateByAccountQuota.delete(key);
-    }
-  }
-}
-
 function headerStyleToQuotaKey(headerStyle: HeaderStyle, family: ModelFamily): string {
   if (family === "claude") return "claude";
   return headerStyle === "antigravity" ? "gemini-antigravity" : "gemini-cli";
+}
+
+/**
+ * Whether an endpoint is usable for the given header style. Gemini CLI models
+ * only work against the production endpoint — sandbox endpoints are skipped.
+ * Mirrors the skip check in the endpoint-fallback loop.
+ */
+function isEndpointUsableForHeaderStyle(endpoint: string, headerStyle: HeaderStyle): boolean {
+  if (headerStyle === "gemini-cli" && endpoint !== ANTIGRAVITY_ENDPOINT_PROD) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Whether any endpoint after `index` in ANTIGRAVITY_ENDPOINT_FALLBACKS is usable
+ * for the given header style. Used to decide, after capacity retries are
+ * exhausted on the current endpoint, whether trying the next endpoint can make
+ * progress or whether we must switch accounts instead.
+ */
+function hasUsableEndpointAfterIndex(index: number, headerStyle: HeaderStyle): boolean {
+  for (let j = index + 1; j < ANTIGRAVITY_ENDPOINT_FALLBACKS.length; j++) {
+    const endpoint = ANTIGRAVITY_ENDPOINT_FALLBACKS[j]
+    if (endpoint && isEndpointUsableForHeaderStyle(endpoint, headerStyle)) {
+      return true
+    }
+  }
+  return false
 }
 
 // Track consecutive non-429 failures per account to prevent infinite loops
@@ -1446,6 +1474,110 @@ function trackAccountFailure(accountIndex: number): { failures: number; shouldCo
 
 function resetAccountFailureState(accountIndex: number): void {
   accountFailureState.delete(accountIndex);
+}
+
+/**
+ * Compute the new numeric index for a per-account state key after the account
+ * at `removedIndex` has been spliced out and subsequent indices renumbered
+ * down by one (see AccountManager.removeAccount). Returns null when the entry
+ * belonged to the removed account and should be dropped.
+ */
+function remapIndexAfterRemoval(index: number, removedIndex: number): number | null {
+  if (index === removedIndex) return null
+  return index > removedIndex ? index - 1 : index
+}
+
+/**
+ * Remap a Set of numeric account indices in place after an account removal.
+ * Drops the removed index and shifts higher indices down by one so the set
+ * keeps referring to the same accounts after renumbering.
+ */
+function remapIndexSetAfterRemoval(set: Set<number>, removedIndex: number): void {
+  const values = [...set]
+  set.clear()
+  for (const index of values) {
+    const next = remapIndexAfterRemoval(index, removedIndex)
+    if (next !== null) set.add(next)
+  }
+}
+
+/**
+ * Remap all module-level per-account state after the account at `removedIndex`
+ * is removed from the pool. AccountManager.removeAccount() splices the account
+ * out and renumbers every subsequent account's index down by one; index-keyed
+ * state here must follow suit or it silently attaches to the wrong account.
+ * Also folds in the old resetAllRateLimitStateForAccount cleanup (the removed
+ * account's rate-limit entries are dropped).
+ */
+function remapAccountStateAfterRemoval(removedIndex: number): void {
+  // accountFailureState: Map<accountIndex, ...>
+  const failureEntries = [...accountFailureState.entries()]
+  accountFailureState.clear()
+  for (const [index, state] of failureEntries) {
+    const next = remapIndexAfterRemoval(index, removedIndex)
+    if (next !== null) accountFailureState.set(next, state)
+  }
+
+  // rateLimitStateByAccountQuota: Map<`${accountIndex}:${quotaKey}`, ...>
+  const rateEntries = [...rateLimitStateByAccountQuota.entries()]
+  rateLimitStateByAccountQuota.clear()
+  for (const [key, state] of rateEntries) {
+    const sep = key.indexOf(":")
+    const index = Number(key.slice(0, sep))
+    const quotaKey = key.slice(sep + 1)
+    if (sep < 0 || Number.isNaN(index)) {
+      // Malformed key — preserve as-is rather than dropping silently.
+      rateLimitStateByAccountQuota.set(key, state)
+      continue
+    }
+    const next = remapIndexAfterRemoval(index, removedIndex)
+    if (next !== null) rateLimitStateByAccountQuota.set(`${next}:${quotaKey}`, state)
+  }
+
+  // Trackers in rotation.ts are index-keyed too; keep them attached to the right accounts.
+  getHealthTracker().remapAfterRemoval(removedIndex)
+  getTokenTracker().remapAfterRemoval(removedIndex)
+}
+
+/**
+ * Test-only hooks. NOT part of the plugin's runtime surface — exported so unit
+ * tests can exercise the pure loop-escape / index-remap / warmup helpers and
+ * inspect the index-keyed module state they mutate. Kept in one object to avoid
+ * scattering `export` across internal helpers.
+ */
+export const loopEscapeTestHooks = {
+  hasUsableEndpointAfterIndex,
+  isEndpointUsableForHeaderStyle,
+  resolveQuotaFallbackHeaderStyle,
+  remapIndexAfterRemoval,
+  remapIndexSetAfterRemoval,
+  remapAccountStateAfterRemoval,
+  trackWarmupAttempt,
+  getWarmupAttemptCount,
+  markWarmupSuccess,
+  MAX_WARMUP_SESSIONS,
+  seedAccountFailure(index: number, consecutiveFailures: number): void {
+    accountFailureState.set(index, { consecutiveFailures, lastFailureAt: Date.now() })
+  },
+  getAccountFailureCount(index: number): number | undefined {
+    return accountFailureState.get(index)?.consecutiveFailures
+  },
+  seedRateLimitState(index: number, quotaKey: string, consecutive429: number): void {
+    rateLimitStateByAccountQuota.set(`${index}:${quotaKey}`, {
+      consecutive429,
+      lastAt: Date.now(),
+      quotaKey,
+    })
+  },
+  getRateLimitConsecutive(index: number, quotaKey: string): number | undefined {
+    return rateLimitStateByAccountQuota.get(`${index}:${quotaKey}`)?.consecutive429
+  },
+  resetAllInternalState(): void {
+    accountFailureState.clear()
+    rateLimitStateByAccountQuota.clear()
+    warmupAttemptCounts.clear()
+    warmupSucceededSessionIds.clear()
+  },
 }
 
 /**
@@ -1543,16 +1675,18 @@ export const createAntigravityPlugin = (providerId: string) => async (
     // Track if this is a child session (subagent, background task)
     // This is used to filter toasts based on toast_scope config
     if (input.event.type === "session.created") {
-      const props = input.event.properties as { info?: { parentID?: string } } | undefined;
-      if (props?.info?.parentID) {
+      const props = input.event.properties as { info?: { id?: string; parentID?: string } } | undefined;
+      const sessionID = props?.info?.id;
+      const parentID = props?.info?.parentID;
+      if (parentID) {
         isChildSession = true;
-        childSessionParentID = props.info.parentID;
-        log.debug("child-session-detected", { parentID: props.info.parentID });
+        childSessionParentID = parentID;
+        log.debug("child-session-detected", { sessionID, parentID });
       } else {
         // Reset for root sessions - important when plugin instance is reused
         isChildSession = false;
         childSessionParentID = undefined;
-        log.debug("root-session-detected", {});
+        log.debug("root-session-detected", { sessionID });
       }
     }
     
@@ -1924,11 +2058,14 @@ export const createAntigravityPlugin = (providerId: string) => async (
           const showToast = async (message: string, variant: "info" | "warning" | "success" | "error") => {
             // Always log to debug regardless of toast filtering
             log.debug("toast", { message, variant, isChildSession, toastScope });
-            
+
             if (quietMode) return;
             if (abortSignal?.aborted) return;
-            
-            // Filter toasts for child sessions when toast_scope is "root_only"
+
+            // Filter toasts for child sessions when toast_scope is "root_only".
+            // Uses the last-event heuristic globals (see the KNOWN LIMITATION note
+            // where they're declared) — per-request session correlation isn't
+            // available from the fetch interceptor.
             if (toastScope === "root_only" && isChildSession) {
               log.debug("toast-suppressed-child-session", { message, variant, parentID: childSessionParentID });
               return;
@@ -2050,6 +2187,11 @@ export const createAntigravityPlugin = (providerId: string) => async (
               // mid-request (this is the case that previously spun forever for
               // an Antigravity-only model whose antigravity pool is exhausted).
               if (accountCount > 0 && triedSwitchIndices.size >= accountCount) {
+                // Terminal (last-resort) fallback: every account has been tried, so
+                // there is nothing left to rotate to. Intentionally UNguarded — we
+                // return whatever the SDK gives, even a retryable failure, as a
+                // bubble-able Response (project convention: return a Response rather
+                // than throw) instead of falling through to a bare error.
                 const exhaustedFallback = await tryAgySdkFallbackForRequest(input, init, config, agySdkCredentials, urlString);
                 if (exhaustedFallback) return exhaustedFallback;
                 if (lastFailure) {
@@ -2228,8 +2370,13 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 }
               } catch (error) {
                 if (error instanceof AntigravityTokenRefreshError && error.code === "invalid_grant") {
+                  // Capture the index BEFORE removal — removeAccount renumbers all
+                  // subsequent accounts, so index-keyed state must be remapped to match.
+                  const removedIndex = account.index;
                   const removed = accountManager.removeAccount(account);
                   if (removed) {
+                    remapAccountStateAfterRemoval(removedIndex);
+                    remapIndexSetAfterRemoval(triedSwitchIndices, removedIndex);
                     log.warn("Removed revoked account from pool - reauthenticate via `opencode auth login`");
                     try {
                       await accountManager.persistAccountRemoval(account.parts.refreshToken);
@@ -2385,7 +2532,9 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 markWarmupSuccess(prepared.sessionId);
                 pushDebug("thinking-warmup: done");
               } catch (error) {
-                clearWarmupAttempt(prepared.sessionId);
+                // Do NOT clear the attempt on failure — failed warmups must count
+                // toward MAX_WARMUP_RETRIES so a session that always fails warmup
+                // stops retrying after the cap instead of priming every request.
                 pushDebug(
                   `thinking-warmup: failed ${error instanceof Error ? error.message : String(error)}`,
                 );
@@ -2572,41 +2721,103 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   // Goal: Wait and Retry SAME Account. DO NOT LOCK.
                   // We handle this FIRST to avoid calling getRateLimitBackoff() and polluting the global rate limit state for transient errors.
                   if (rateLimitReason === "MODEL_CAPACITY_EXHAUSTED" || rateLimitReason === "SERVER_ERROR") {
-                     // Exponential backoff with jitter for capacity errors: 1s → 2s → 4s → 8s (max)
-                     // Matches Antigravity-Manager's ExponentialBackoff(1s, 8s)
-                     const baseDelayMs = 1000;
-                     const maxDelayMs = 8000;
-                     const exponentialDelay = Math.min(baseDelayMs * Math.pow(2, capacityRetryCount), maxDelayMs);
-                     // Add ±10% jitter to prevent thundering herd
-                     const jitter = exponentialDelay * (0.9 + Math.random() * 0.2);
-                     const waitMs = Math.round(jitter);
-                     const waitSec = Math.round(waitMs / 1000);
-                     
-                     pushDebug(`Server busy (${rateLimitReason}) on account ${account.index}, exponential backoff ${waitMs}ms (attempt ${capacityRetryCount + 1})`);
-
-                     await showToast(
-                       `⏳ Server busy (${response.status}). Retrying in ${waitSec}s...`,
-                       "warning",
-                     );
-                     
-                     await sleep(waitMs, abortSignal);
-                     
-                     // CRITICAL FIX: Decrement i so that the loop 'continue' retries the SAME endpoint index
-                     // (i++ in the loop will bring it back to the current index)
-                     // But limit retries to prevent infinite loops (Greptile feedback)
+                     // Retry the SAME account/endpoint a bounded number of times with
+                     // exponential backoff (1s → 2s → 4s → 8s max, ±10% jitter to avoid a
+                     // thundering herd). Only the retrying path toasts and sleeps — the
+                     // terminal (4th) failure must escape immediately, without a misleading
+                     // "retrying" toast or a wasted multi-second wait.
                      if (capacityRetryCount < 3) {
+                       const baseDelayMs = 1000;
+                       const maxDelayMs = 8000;
+                       const exponentialDelay = Math.min(baseDelayMs * Math.pow(2, capacityRetryCount), maxDelayMs);
+                       const jitter = exponentialDelay * (0.9 + Math.random() * 0.2);
+                       const waitMs = Math.round(jitter);
+                       const waitSec = Math.round(waitMs / 1000);
+
+                       pushDebug(`Server busy (${rateLimitReason}) on account ${account.index}, exponential backoff ${waitMs}ms (attempt ${capacityRetryCount + 1})`);
+                       await showToast(
+                         `⏳ Server busy (${response.status}). Retrying in ${waitSec}s...`,
+                         "warning",
+                       );
+                       await sleep(waitMs, abortSignal);
+
+                       // Decrement i so the loop 'continue' retries the SAME endpoint index
+                       // (the for-loop's i++ brings it back to the current index).
                        capacityRetryCount++;
                        i -= 1;
-                       continue; 
-                      } else {
-                        pushDebug(`Max capacity retries (3) exhausted for endpoint ${currentEndpoint}, regenerating fingerprint...`);
-                        // Regenerate fingerprint to get fresh device identity before trying next endpoint
-                        const newFingerprint = accountManager.regenerateAccountFingerprint(account.index);
-                        if (newFingerprint) {
-                          pushDebug(`Fingerprint regenerated for account ${account.index}`);
-                        }
-                        continue;
-                      }
+                       continue;
+                     }
+
+                     // Capacity retries exhausted for this endpoint.
+                     pushDebug(`Max capacity retries (3) exhausted for endpoint ${currentEndpoint}, regenerating fingerprint...`);
+                     // Regenerate fingerprint to get a fresh device identity before trying elsewhere.
+                     const newFingerprint = accountManager.regenerateAccountFingerprint(account.index);
+                     if (newFingerprint) {
+                       pushDebug(`Fingerprint regenerated for account ${account.index}`);
+                     }
+
+                     // Prefer the next usable endpoint on the SAME header style (existing behavior).
+                     if (hasUsableEndpointAfterIndex(i, headerStyle)) {
+                       continue;
+                     }
+
+                     // No further usable endpoint for this header style. Falling through to the
+                     // for-loop's natural exit would let `while (!shouldSwitchAccount)` re-enter,
+                     // reset capacityRetryCount to 0, and spin this SAME account forever (the
+                     // outer loopGuard/account-rotation is never reached). For gemini-cli, PROD
+                     // is the only usable endpoint, so this is the common case.
+                     //
+                     // Before excluding the WHOLE account, give the alternate quota pool + SDK
+                     // fallback a chance on the SAME account (e.g. antigravity capacity-exhausted
+                     // but gemini-cli quota still fine), mirroring STRATEGY 2. Marking the current
+                     // (transient) pool rate-limited BEFORE getAvailableHeaderStyle is required so
+                     // it returns the ALTERNATE style rather than the still-unmarked current one.
+                     accountManager.markRateLimitedWithReason(account, family, headerStyle, model, rateLimitReason, serverRetryMs);
+
+                     if (family === "gemini" && allowQuotaFallback) {
+                       const alternateStyle = accountManager.getAvailableHeaderStyle(account, family, model);
+                       const fallbackStyle = resolveQuotaFallbackHeaderStyle({ family, headerStyle, alternateStyle });
+                       if (fallbackStyle) {
+                         const safeModelName = model || "this model";
+                         const currentQuotaName = headerStyle === "antigravity" ? "Antigravity" : "Gemini CLI";
+                         await showToast(
+                           `Server busy on ${currentQuotaName} quota for ${safeModelName}. Trying alternate quota...`,
+                           "warning",
+                         );
+                         headerStyle = fallbackStyle;
+                         pushDebug(`capacity fallback: ${headerStyle}`);
+                         continue;
+                       }
+                     }
+
+                     // Try the Antigravity SDK / Gemini API-key fallback before giving up the account.
+                     // Only a SUCCESSFUL / non-retryable SDK response is terminal — tryFetch...()
+                     // can return its last RETRYABLE failure (401/403/429/500/502/503/504/529, see
+                     // isRetryableAgySdkCredentialStatus). Returning that would strand a healthy OAuth
+                     // account that never got tried, so on a retryable SDK failure we fall through to
+                     // account rotation (same guard as the prefer_for_gemini path).
+                     const capacityAgySdkFallback = await tryAgySdkFallbackForRequest(
+                       input,
+                       init,
+                       config,
+                       agySdkCredentials,
+                       urlString,
+                     );
+                     if (capacityAgySdkFallback && !isRetryableAgySdkCredentialStatus(capacityAgySdkFallback.status)) {
+                       return capacityAgySdkFallback;
+                     }
+
+                     // Both quota pools exhausted and no SDK fallback — escape to the outer
+                     // account-rotation loop (loopGuard + rotation apply there).
+                     pushDebug(
+                       `No further usable endpoint or quota for headerStyle=${headerStyle} after capacity exhaustion; switching account`,
+                     );
+                     lastError = new Error(
+                       `Model capacity exhausted (${rateLimitReason}) on account ${account.index} after ${capacityRetryCount} retries`,
+                     );
+                     lastFailure = createFailureContext(response);
+                     shouldSwitchAccount = true;
+                     break;
                   }
 
                   // STRATEGY 2: RATE LIMIT EXCEEDED (RPM) / QUOTA EXHAUSTED / UNKNOWN
@@ -2746,7 +2957,15 @@ export const createAntigravityPlugin = (providerId: string) => async (
                     agySdkCredentials,
                     urlString,
                   );
-                  if (agySdkFallbackResponse) return agySdkFallbackResponse;
+                  // Only a SUCCESSFUL / non-retryable SDK response is terminal here.
+                  // tryFetch...() can return its last RETRYABLE failure (401/403/429/
+                  // 500/502/503/504/529, see isRetryableAgySdkCredentialStatus); returning
+                  // that would short-circuit the account rotation below (shouldSwitchAccount)
+                  // and strand a healthy account. On a retryable SDK failure, fall through
+                  // to rotate.
+                  if (agySdkFallbackResponse && !isRetryableAgySdkCredentialStatus(agySdkFallbackResponse.status)) {
+                    return agySdkFallbackResponse;
+                  }
 
                   const quotaName = headerStyle === "antigravity" ? "Antigravity" : "Gemini CLI";
 
@@ -3512,7 +3731,12 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   await removeAccountFromStorage(deletedAccount.refreshToken);
                 }
                 // Sync in-memory state so deleted account stops being used immediately
-                activeAccountManager?.removeAccountByIndex(menuResult.deleteAccountIndex);
+                const removedFromPool = activeAccountManager?.removeAccountByIndex(menuResult.deleteAccountIndex);
+                if (removedFromPool) {
+                  // Renumbering shifted subsequent account indices down by one —
+                  // remap index-keyed module state to keep it attached correctly.
+                  remapAccountStateAfterRemoval(menuResult.deleteAccountIndex);
+                }
                 console.log("\nAccount deleted.\n");
 
                 if (updatedAccounts.length > 0) {

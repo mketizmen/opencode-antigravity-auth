@@ -353,16 +353,6 @@ export interface SessionRecoveryHook {
    * Check if the error is recoverable.
    */
   isRecoverableError: (error: unknown) => boolean;
-
-  /**
-   * Callback for when a session is being aborted for recovery.
-   */
-  setOnAbortCallback: (callback: (sessionID: string) => void) => void;
-
-  /**
-   * Callback for when recovery is complete (success or failure).
-   */
-  setOnRecoveryCompleteCallback: (callback: (sessionID: string) => void) => void;
 }
 
 export interface SessionRecoveryContext {
@@ -384,16 +374,6 @@ export function createSessionRecoveryHook(
 
   const { client, directory } = ctx;
   const processingErrors = new Set<string>();
-  let onAbortCallback: ((sessionID: string) => void) | null = null;
-  let onRecoveryCompleteCallback: ((sessionID: string) => void) | null = null;
-
-  const setOnAbortCallback = (callback: (sessionID: string) => void): void => {
-    onAbortCallback = callback;
-  };
-
-  const setOnRecoveryCompleteCallback = (callback: (sessionID: string) => void): void => {
-    onRecoveryCompleteCallback = callback;
-  };
 
   const handleSessionRecovery = async (info: MessageInfo): Promise<boolean> => {
     // Validate input
@@ -417,20 +397,25 @@ export function createSessionRecoveryHook(
       providedMsgID: assistantMsgID ?? "none",
     });
 
-    // Notify abort callback early
-    if (onAbortCallback) {
-      onAbortCallback(sessionID);
-    }
-
     // Abort current request
     await client.session.abort({ path: { id: sessionID } }).catch(() => {});
 
-    // Fetch messages - needed to find the failed message
-    const messagesResp = await client.session.messages({
-      path: { id: sessionID },
-      query: { directory },
-    });
-    msgs = (messagesResp as { data?: MessageData[] }).data;
+    // Fetch messages - needed to find the failed message.
+    // Guard against fetch failure so a rejected messages() call doesn't leave the
+    // session aborted with an unhandled rejection and no user-facing toast.
+    try {
+      const messagesResp = await client.session.messages({
+        path: { id: sessionID },
+        query: { directory },
+      });
+      msgs = (messagesResp as { data?: MessageData[] }).data;
+    } catch (err) {
+      log.error("Failed to fetch session messages during recovery", {
+        sessionID,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
 
     // If messageID wasn't provided, find the latest assistant message with an error
     if (!assistantMsgID && msgs && msgs.length > 0) {
@@ -501,18 +486,11 @@ export function createSessionRecoveryHook(
       return false;
     } finally {
       processingErrors.delete(assistantMsgID);
-
-      // Always notify recovery complete
-      if (sessionID && onRecoveryCompleteCallback) {
-        onRecoveryCompleteCallback(sessionID);
-      }
     }
   };
 
   return {
     handleSessionRecovery,
     isRecoverableError,
-    setOnAbortCallback,
-    setOnRecoveryCompleteCallback,
   };
 }

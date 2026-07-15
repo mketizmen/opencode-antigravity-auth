@@ -30,7 +30,22 @@ const GEMINI_MODELS_LIST_TIMEOUT_MS = 10000;
 const GEMINI_MODELS_LIST_MAX_PAGES = 20;
 
 export function isRetryableAgySdkCredentialStatus(status: number): boolean {
-  return status === 401 || status === 403 || status === 429 || status === 503 || status === 529;
+  // Credential-level or transient statuses where trying another API key (and, at
+  // the OAuth fallback guard sites, rotating to another account) can still help:
+  //   401/403  — this key is unauthorized/forbidden; another key may work.
+  //   429/503/529 — rate-limited / overloaded; back off and try elsewhere.
+  //   500/502/504 — transient upstream server errors; NOT terminal, so retry
+  //   another key/account rather than surfacing them as a final failure.
+  return (
+    status === 401 ||
+    status === 403 ||
+    status === 429 ||
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    status === 529
+  );
 }
 
 export function resetAgySdkCredentialStateForTests(): void {

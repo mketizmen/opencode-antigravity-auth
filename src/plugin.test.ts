@@ -33,9 +33,10 @@ vi.mock("./plugin/storage", async (importOriginal) => {
   };
 });
 
-const { createAntigravityPlugin } = await import("./plugin");
+const { createAntigravityPlugin, loopEscapeTestHooks } = await import("./plugin");
 const storageModule = await import("./plugin/storage");
 const { resetPublicGeminiApiModelCatalogForTests } = await import("./plugin/model-catalog");
+const { resetAgySdkCredentialStateForTests } = await import("./plugin/api-key");
 
 const client = {
   tui: { showToast: vi.fn(async () => undefined) },
@@ -910,4 +911,272 @@ describe("createAntigravityPlugin auth.loader 404→agy-sdk fallback", () => {
     });
     expect(apiKeyFallbackCalls.length).toBeGreaterThan(0);
   });
+});
+
+describe("createAntigravityPlugin capacity-exhaustion header-style fallback (review fix 1)", () => {
+  let tmpConfigHome: string;
+  const savedEnv: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    tmpConfigHome = join(tmpdir(), `opencode-antigravity-cap-${process.pid}-${Date.now()}`);
+    mkdirSync(tmpConfigHome, { recursive: true });
+    savedEnv.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
+    savedEnv.OPENCODE_ANTIGRAVITY_API_KEYS = process.env.OPENCODE_ANTIGRAVITY_API_KEYS;
+    savedEnv.GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    savedEnv.GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+    process.env.XDG_CONFIG_HOME = tmpConfigHome;
+    // No API keys → no agy-sdk fallback path, isolating the header-style fallback.
+    delete process.env.OPENCODE_ANTIGRAVITY_API_KEYS;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.GOOGLE_API_KEY;
+    vi.mocked(storageModule.loadAccounts).mockReset();
+    // Reset module-level singletons so a prior test's api-key cooldown or per-account
+    // rate-limit state can't leak into this one (they persist across the module).
+    resetAgySdkCredentialStateForTests();
+    loopEscapeTestHooks.resetAllInternalState();
+  });
+
+  afterEach(() => {
+    for (const [key, val] of Object.entries(savedEnv)) {
+      if (val === undefined) delete process.env[key];
+      else process.env[key] = val;
+    }
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  const headerValue = (
+    input: RequestInfo,
+    init: RequestInit | undefined,
+    name: string,
+  ): string | null => {
+    const fromInit = init?.headers;
+    const sources = [fromInit, input instanceof Request ? input.headers : undefined];
+    for (const h of sources) {
+      if (!h) continue;
+      if (h instanceof Headers) {
+        const v = h.get(name);
+        if (v) return v;
+      } else if (Array.isArray(h)) {
+        const found = h.find(([k]) => k.toLowerCase() === name.toLowerCase());
+        if (found) return found[1];
+      } else if (typeof h === "object") {
+        const key = Object.keys(h).find((k) => k.toLowerCase() === name.toLowerCase());
+        if (key) return (h as Record<string, string>)[key] ?? null;
+      }
+    }
+    return null;
+  };
+
+  it("capacity-exhausted on antigravity retries gemini-cli quota on the SAME account before rotating", async () => {
+    const now = Date.now();
+    vi.mocked(storageModule.loadAccounts).mockResolvedValue({
+      version: 4,
+      accounts: [
+        {
+          email: "solo@example.com",
+          refreshToken: "refresh-token",
+          projectId: "project-id",
+          managedProjectId: "managed-project-id",
+          addedAt: now,
+          lastUsed: now,
+          enabled: true,
+        },
+      ],
+      activeIndex: 0,
+    });
+
+    let antigravityContentCalls = 0;
+    let geminiCliContentCalls = 0;
+
+    const fetchMock = vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : (input as Request).url;
+
+      if (url.includes("oauth2.googleapis.com")) {
+        return new Response(
+          JSON.stringify({ access_token: "access-token", expires_in: 3600, token_type: "Bearer" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+
+      // Antigravity backend (all endpoints contain "cloudcode-pa"). gemini-cli also
+      // uses the PROD host, so distinguish the pools by User-Agent.
+      if (url.includes("cloudcode-pa")) {
+        const ua = headerValue(input, init, "user-agent") ?? "";
+        const isGeminiCli = ua.includes("nodejs-client");
+        if (isGeminiCli) {
+          geminiCliContentCalls++;
+          return new Response(
+            JSON.stringify({
+              response: {
+                candidates: [
+                  { content: { parts: [{ text: "ok" }], role: "model" }, finishReason: "STOP", index: 0 },
+                ],
+              },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        // Antigravity pool: always capacity-exhausted (503 → MODEL_CAPACITY_EXHAUSTED).
+        antigravityContentCalls++;
+        return new Response(
+          JSON.stringify({ error: { code: 503, message: "The model is overloaded. Please try again later.", status: "UNAVAILABLE" } }),
+          { status: 503, headers: { "content-type": "application/json" } },
+        );
+      }
+
+      if (url.includes("generativelanguage.googleapis.com")) {
+        return new Response(JSON.stringify({ models: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("1.2.3");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plugin = await createAntigravityPlugin("google")({
+      client,
+      directory: process.cwd(),
+    });
+    const loader = await plugin.auth.loader(
+      async () => ({
+        type: "oauth" as const,
+        refresh: formatRefreshParts({
+          refreshToken: "refresh-token",
+          projectId: "project-id",
+          managedProjectId: "managed-project-id",
+        }),
+        access: "access-token",
+        expires: now + 3_600_000,
+      }),
+      { id: "google", api: "https://generativelanguage.googleapis.com/v1beta", npm: "@ai-sdk/google", models: {} },
+    );
+
+    // Fake timers so the capacity exponential backoffs (1s→2s→4s per endpoint)
+    // don't make the test take ~20s of real time.
+    vi.useFakeTimers();
+    const fetchPromise = (loader as { fetch: typeof fetch }).fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+      { method: "POST", body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hello" }] }] }) },
+    );
+    let settled = false;
+    fetchPromise.then(() => { settled = true; }, () => { settled = true; });
+    for (let i = 0; i < 80 && !settled; i++) {
+      await vi.advanceTimersByTimeAsync(10_000);
+    }
+    const response = await fetchPromise;
+    vi.useRealTimers();
+
+    // The request must ultimately SUCCEED via the gemini-cli quota on the same account,
+    // proving the capacity path fell back to the alternate quota pool before rotating.
+    expect(response.status, `antigravity=${antigravityContentCalls} geminiCli=${geminiCliContentCalls}`).toBe(200);
+    expect(antigravityContentCalls).toBeGreaterThan(0); // antigravity was tried and capacity-exhausted
+    expect(geminiCliContentCalls).toBeGreaterThan(0); // then gemini-cli was tried on the SAME account
+  }, 20_000);
+
+  // Regression for the round-2/round-3 HIGH: tryAgySdkFallbackForRequest can return
+  // its last RETRYABLE failure (429 and, after round-3, transient 5xx like 500). The
+  // capacity-escape must NOT treat that as terminal — it should keep rotating so a
+  // healthy second account gets tried.
+  async function runCapacitySdkRetryableRotation(sdkStatus: number, sdkReason: string) {
+    process.env.OPENCODE_ANTIGRAVITY_API_KEYS = "test-sdk-key";
+    const now = Date.now();
+    vi.mocked(storageModule.loadAccounts).mockResolvedValue({
+      version: 4,
+      accounts: [
+        { email: "a@example.com", refreshToken: "refresh-A", projectId: "proj", managedProjectId: "managed", addedAt: now, lastUsed: now, enabled: true },
+        { email: "b@example.com", refreshToken: "refresh-B", projectId: "proj", managedProjectId: "managed", addedAt: now, lastUsed: now, enabled: true },
+      ],
+      activeIndex: 0,
+    });
+
+    let sdkApiKeyCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : (input as Request).url;
+      if (url.includes("oauth2.googleapis.com")) {
+        return new Response(
+          JSON.stringify({ access_token: "access-token", expires_in: 3600, token_type: "Bearer" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      // OAuth content path (both quota pools) → always capacity-exhausted (503).
+      if (url.includes("cloudcode-pa")) {
+        return new Response(
+          JSON.stringify({ error: { code: 503, message: "The model is overloaded. Please try again later.", status: "UNAVAILABLE" } }),
+          { status: 503, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.includes("generativelanguage.googleapis.com")) {
+        // agy-sdk fallback (api-key path) → the retryable failure under test.
+        if (headerValue(input, init, "x-goog-api-key")) {
+          sdkApiKeyCalls++;
+          return new Response(
+            JSON.stringify({ error: { code: sdkStatus, message: sdkReason, status: "ERROR" } }),
+            { status: sdkStatus, headers: { "content-type": "application/json" } },
+          );
+        }
+        // Model-list GET.
+        return new Response(JSON.stringify({ models: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("1.2.3");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    // Observe which account indices the router actually selects, without replacing
+    // the real selection logic.
+    const selectedIndices: number[] = [];
+    const originalSelect = AccountManager.prototype.getCurrentOrNextForFamily;
+    const selectSpy = vi
+      .spyOn(AccountManager.prototype, "getCurrentOrNextForFamily")
+      .mockImplementation(function (this: AccountManager, ...selectArgs: unknown[]) {
+        const acct = (originalSelect as (...a: unknown[]) => { index: number } | null).apply(this, selectArgs);
+        if (acct) selectedIndices.push(acct.index);
+        return acct as ReturnType<typeof originalSelect>;
+      });
+
+    try {
+      const plugin = await createAntigravityPlugin("google")({ client, directory: process.cwd() });
+      const loader = await plugin.auth.loader(
+        async () => ({
+          type: "oauth" as const,
+          refresh: formatRefreshParts({ refreshToken: "refresh-A", projectId: "proj", managedProjectId: "managed" }),
+          access: "access-token",
+          expires: now + 3_600_000,
+        }),
+        { id: "google", api: "https://generativelanguage.googleapis.com/v1beta", npm: "@ai-sdk/google", models: {} },
+      );
+
+      vi.useFakeTimers();
+      const fetchPromise = (loader as { fetch: typeof fetch }).fetch(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+        { method: "POST", body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hello" }] }] }) },
+      );
+      let settled = false;
+      fetchPromise.then(() => { settled = true; }, () => { settled = true; });
+      for (let i = 0; i < 200 && !settled; i++) {
+        await vi.advanceTimersByTimeAsync(10_000);
+      }
+      await fetchPromise;
+      vi.useRealTimers();
+
+      // The SDK fallback was attempted (proving we reached the capacity SDK step)...
+      expect(sdkApiKeyCalls).toBeGreaterThan(0);
+      // ...and because the SDK status was retryable, the router rotated to the SECOND
+      // account instead of returning the SDK failure. Both accounts must be selected.
+      expect(selectedIndices, `selected=${JSON.stringify(selectedIndices)}`).toContain(0);
+      expect(selectedIndices, `selected=${JSON.stringify(selectedIndices)}`).toContain(1);
+    } finally {
+      selectSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  }
+
+  it("capacity-exhausted both pools + RETRYABLE SDK 429 rotates to the healthy second account", async () => {
+    await runCapacitySdkRetryableRotation(429, "Resource has been exhausted");
+  }, 20_000);
+
+  it("capacity-exhausted both pools + transient SDK 500 rotates to the healthy second account", async () => {
+    await runCapacitySdkRetryableRotation(500, "Internal server error");
+  }, 20_000);
 });

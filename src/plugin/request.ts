@@ -6,6 +6,7 @@ import {
   EMPTY_SCHEMA_PLACEHOLDER_NAME,
   EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION,
   SKIP_THOUGHT_SIGNATURE,
+  MIN_SIGNATURE_LENGTH,
   getRandomizedHeaders,
   type HeaderStyle,
 } from "../constants";
@@ -34,6 +35,7 @@ import {
   extractUsageFromSsePayload,
   extractUsageMetadata,
   fixToolResponseGrouping,
+  getThinkingText,
   validateAndFixClaudeToolPairing,
   applyToolPairingFixes,
   injectParameterSignatures,
@@ -83,9 +85,32 @@ const log = createLogger("request");
 
 const PLUGIN_SESSION_ID = `-${crypto.randomUUID()}`;
 
-const sessionDisplayedThinkingHashes = new Set<string>();
+// Per-session dedup of streamed thinking text (Gemini-3). Keyed by sessionId so
+// identical thinking text in DIFFERENT sessions is NOT cross-suppressed, and so
+// the memory footprint stays bounded (old sessions are evicted FIFO). A single
+// shared Set would grow unbounded and leak dedup state across conversations.
+const MAX_DEDUP_SESSIONS = 50;
+const sessionDisplayedThinkingHashes = new Map<string, Set<string>>();
 
-const MIN_SIGNATURE_LENGTH = 50;
+function getDisplayedThinkingHashes(
+  sessionId: string | undefined,
+): Set<string> | undefined {
+  if (!sessionId) {
+    return undefined;
+  }
+  let hashes = sessionDisplayedThinkingHashes.get(sessionId);
+  if (!hashes) {
+    hashes = new Set<string>();
+    sessionDisplayedThinkingHashes.set(sessionId, hashes);
+    if (sessionDisplayedThinkingHashes.size > MAX_DEDUP_SESSIONS) {
+      const oldestKey = sessionDisplayedThinkingHashes.keys().next().value;
+      if (oldestKey !== undefined) {
+        sessionDisplayedThinkingHashes.delete(oldestKey);
+      }
+    }
+  }
+  return hashes;
+}
 
 function buildSignatureSessionKey(
   sessionId: string,
@@ -461,7 +486,7 @@ function sanitizeRequestPayloadForAntigravity(
             ) {
               continue;
             }
-            const thoughtText = getThinkingPartText(candidatePart);
+            const thoughtText = getThinkingText(candidatePart);
             if (!thoughtText) {
               continue;
             }
@@ -567,33 +592,12 @@ function isGeminiThinkingPart(part: any): boolean {
   );
 }
 
-// Sentinel value used when signature recovery fails - allows Claude to handle gracefully
-// by redacting the thinking block instead of rejecting the request entirely.
-// Reference: LLM-API-Key-Proxy uses this pattern for Gemini 3 tool calls.
-const SENTINEL_SIGNATURE = "skip_thought_signature_validator";
-
-function getThinkingPartText(part: any): string {
-  if (!part || typeof part !== "object") {
-    return "";
-  }
-
-  if (typeof part.text === "string") {
-    return part.text;
-  }
-
-  if (typeof part.thinking === "string") {
-    return part.thinking;
-  }
-
-  return "";
-}
-
 function hasCachedMatchingSignature(part: any, sessionId: string): boolean {
   if (!part || typeof part !== "object") {
     return false;
   }
 
-  const text = getThinkingPartText(part);
+  const text = getThinkingText(part);
   if (!text) {
     return false;
   }
@@ -619,13 +623,13 @@ function ensureThoughtSignature(part: any, sessionId: string): any {
     return part;
   }
 
-  const text = getThinkingPartText(part);
+  const text = getThinkingText(part);
   if (!text) {
     return part;
   }
 
   if (part.thought === true) {
-    return { ...part, thoughtSignature: SENTINEL_SIGNATURE };
+    return { ...part, thoughtSignature: SKIP_THOUGHT_SIGNATURE };
   }
 
   if (
@@ -633,7 +637,7 @@ function ensureThoughtSignature(part: any, sessionId: string): any {
     part.type === "reasoning" ||
     part.type === "redacted_thinking"
   ) {
-    return { ...part, signature: SENTINEL_SIGNATURE };
+    return { ...part, signature: SKIP_THOUGHT_SIGNATURE };
   }
 
   return part;
@@ -645,10 +649,7 @@ function hasSignedThinkingPart(part: any, sessionId?: string): boolean {
   }
 
   if (part.thought === true) {
-    if (
-      part.thoughtSignature === SENTINEL_SIGNATURE ||
-      part.thoughtSignature === SKIP_THOUGHT_SIGNATURE
-    ) {
+    if (part.thoughtSignature === SKIP_THOUGHT_SIGNATURE) {
       return true;
     }
 
@@ -671,10 +672,7 @@ function hasSignedThinkingPart(part: any, sessionId?: string): boolean {
     part.type === "reasoning" ||
     part.type === "redacted_thinking"
   ) {
-    if (
-      part.signature === SENTINEL_SIGNATURE ||
-      part.signature === SKIP_THOUGHT_SIGNATURE
-    ) {
+    if (part.signature === SKIP_THOUGHT_SIGNATURE) {
       return true;
     }
 
@@ -746,7 +744,7 @@ function ensureThinkingBeforeToolUseInContents(
     const injected = {
       thought: true,
       text: lastThinking.text,
-      thoughtSignature: SENTINEL_SIGNATURE,
+      thoughtSignature: SKIP_THOUGHT_SIGNATURE,
     };
 
     return { ...content, parts: [injected, ...otherParts] };
@@ -762,7 +760,7 @@ function ensureMessageThinkingSignature(block: any, sessionId: string): any {
     return block;
   }
 
-  const text = getThinkingPartText(block);
+  const text = getThinkingText(block);
   if (!text) {
     return block;
   }
@@ -920,6 +918,76 @@ function ensureThinkingBeforeToolUseInMessages(
 
     return { ...message, content: [injected, ...otherBlocks] };
   });
+}
+
+/**
+ * Shared Claude thinking-block sanitization (Steps 0-2), applied identically to
+ * a plain request payload (non-wrapped branch) and to each wrapped request
+ * object. Extracted to remove duplication between the two prepareAntigravityRequest
+ * paths:
+ *   Step 0 - strip cross-model (Gemini) signatures when targeting Claude
+ *   Step 1 - strip corrupted/unsigned thinking blocks
+ *   (optional) attach top-level cache_control for prompt auto-caching
+ *   Step 2 - re-inject signed thinking before tool_use from the signature cache
+ * Tool-pairing (Step 3) and warmup detection differ per branch and stay inline.
+ */
+function applyClaudeThinkingSanitization(
+  target: Record<string, unknown>,
+  opts: {
+    effectiveModel: string;
+    signatureSessionKey: string;
+    isClaudeThinking: boolean;
+    keepThinkingEnabled: boolean;
+    enableClaudePromptAutoCaching: boolean;
+  },
+): void {
+  const {
+    effectiveModel,
+    signatureSessionKey,
+    isClaudeThinking,
+    keepThinkingEnabled,
+    enableClaudePromptAutoCaching,
+  } = opts;
+
+  // Step 0: Sanitize cross-model metadata (strips Gemini signatures when sending to Claude)
+  sanitizeCrossModelPayloadInPlace(target, { targetModel: effectiveModel });
+
+  // Step 1: Strip corrupted/unsigned thinking blocks FIRST
+  deepFilterThinkingBlocks(
+    target,
+    signatureSessionKey,
+    getCachedSignature,
+    true,
+  );
+
+  if (
+    enableClaudePromptAutoCaching &&
+    (target as any).cache_control === undefined
+  ) {
+    (target as any).cache_control = { type: "ephemeral" };
+  }
+
+  // Step 2: THEN inject signed thinking from cache (after stripping)
+  if (
+    isClaudeThinking &&
+    keepThinkingEnabled &&
+    Array.isArray((target as any).contents)
+  ) {
+    (target as any).contents = ensureThinkingBeforeToolUseInContents(
+      (target as any).contents,
+      signatureSessionKey,
+    );
+  }
+  if (
+    isClaudeThinking &&
+    keepThinkingEnabled &&
+    Array.isArray((target as any).messages)
+  ) {
+    (target as any).messages = ensureThinkingBeforeToolUseInMessages(
+      (target as any).messages,
+      signatureSessionKey,
+    );
+  }
 }
 
 /**
@@ -1150,7 +1218,13 @@ export function prepareAntigravityRequest(
   let resolvedProjectId = projectId?.trim() || "";
   let toolDebugMissing = 0;
   const toolDebugSummaries: string[] = [];
-  let toolDebugPayload: string | undefined;
+  // Reference to the final tools array for lazy debug serialization. The full
+  // JSON.stringify is deferred to the getter on the returned object so it only
+  // runs when the debug payload is actually read (the !response.ok error path in
+  // transformAntigravityResponse), not on every tool-bearing request.
+  let toolDebugTools: unknown[] | undefined;
+  let toolDebugPayloadCache: string | undefined;
+  let toolDebugPayloadComputed = false;
   let sessionId: string | undefined;
   let needsSignedThinkingWarmup = false;
   let thinkingRecoveryMessage: string | undefined;
@@ -1310,47 +1384,15 @@ export function prepareAntigravityRequest(
           );
 
           if (isClaude) {
-            // Step 0: Sanitize cross-model metadata (strips Gemini signatures when sending to Claude)
-            sanitizeCrossModelPayloadInPlace(req, {
-              targetModel: effectiveModel,
-            });
-
-            // Step 1: Strip corrupted/unsigned thinking blocks FIRST
-            deepFilterThinkingBlocks(
-              req,
+            // Steps 0-2: cross-model strip, thinking-block filtering, cache_control,
+            // and signed-thinking re-injection (shared with the non-wrapped branch).
+            applyClaudeThinkingSanitization(req as Record<string, unknown>, {
+              effectiveModel,
               signatureSessionKey,
-              getCachedSignature,
-              true,
-            );
-
-            if (
-              enableClaudePromptAutoCaching &&
-              (req as any).cache_control === undefined
-            ) {
-              (req as any).cache_control = { type: "ephemeral" };
-            }
-
-            // Step 2: THEN inject signed thinking from cache (after stripping)
-            if (
-              isClaudeThinking &&
-              keepThinkingEnabled &&
-              Array.isArray((req as any).contents)
-            ) {
-              (req as any).contents = ensureThinkingBeforeToolUseInContents(
-                (req as any).contents,
-                signatureSessionKey,
-              );
-            }
-            if (
-              isClaudeThinking &&
-              keepThinkingEnabled &&
-              Array.isArray((req as any).messages)
-            ) {
-              (req as any).messages = ensureThinkingBeforeToolUseInMessages(
-                (req as any).messages,
-                signatureSessionKey,
-              );
-            }
+              isClaudeThinking,
+              keepThinkingEnabled,
+              enableClaudePromptAutoCaching,
+            });
 
             // Step 3: Apply tool pairing fixes (ID assignment, response matching, orphan recovery)
             applyToolPairingFixes(req as Record<string, unknown>, true);
@@ -1476,12 +1518,6 @@ export function prepareAntigravityRequest(
               rawGenerationConfig,
               extraBody,
             );
-        const hasAssistantHistory =
-          Array.isArray(requestPayload.contents) &&
-          requestPayload.contents.some(
-            (c: any) => c?.role === "model" || c?.role === "assistant",
-          );
-
         // Claude Sonnet 4.6 is non-thinking only.
         // Ignore any client-provided thinkingConfig for this model.
         const lowerEffective = effectiveModel.toLowerCase();
@@ -1554,8 +1590,6 @@ export function prepareAntigravityRequest(
               ? false
               : (resolved.isThinkingModel ??
                   isThinkingCapableModel(effectiveModel)),
-            isClaude,
-            hasAssistantHistory,
           );
 
           const normalizedThinking =
@@ -1895,11 +1929,11 @@ export function prepareAntigravityRequest(
             toolDebugSummaries.push(...geminiResult.toolDebugSummaries);
           }
 
-          try {
-            toolDebugPayload = JSON.stringify(requestPayload.tools);
-          } catch {
-            toolDebugPayload = undefined;
-          }
+          // Capture the tools reference only; serialization is deferred to the
+          // lazy `toolDebugPayload` getter on the returned object (error path only).
+          toolDebugTools = Array.isArray(requestPayload.tools)
+            ? (requestPayload.tools as unknown[])
+            : undefined;
 
           // Apply Claude tool hardening (ported from LLM-API-Key-Proxy)
           // Injects parameter signatures into descriptions and adds system instruction
@@ -1940,47 +1974,15 @@ export function prepareAntigravityRequest(
         // Attempts to restore signatures from cache for multi-turn conversations
         // Handle both Gemini-style contents[] and Anthropic-style messages[] payloads.
         if (isClaude) {
-          // Step 0: Sanitize cross-model metadata (strips Gemini signatures when sending to Claude)
-          sanitizeCrossModelPayloadInPlace(requestPayload, {
-            targetModel: effectiveModel,
-          });
-
-          // Step 1: Strip corrupted/unsigned thinking blocks FIRST
-          deepFilterThinkingBlocks(
-            requestPayload,
+          // Steps 0-2: cross-model strip, thinking-block filtering, cache_control,
+          // and signed-thinking re-injection (shared with the wrapped branch).
+          applyClaudeThinkingSanitization(requestPayload, {
+            effectiveModel,
             signatureSessionKey,
-            getCachedSignature,
-            true,
-          );
-
-          if (
-            enableClaudePromptAutoCaching &&
-            requestPayload.cache_control === undefined
-          ) {
-            requestPayload.cache_control = { type: "ephemeral" };
-          }
-
-          // Step 2: THEN inject signed thinking from cache (after stripping)
-          if (
-            isClaudeThinking &&
-            keepThinkingEnabled &&
-            Array.isArray(requestPayload.contents)
-          ) {
-            requestPayload.contents = ensureThinkingBeforeToolUseInContents(
-              requestPayload.contents,
-              signatureSessionKey,
-            );
-          }
-          if (
-            isClaudeThinking &&
-            keepThinkingEnabled &&
-            Array.isArray(requestPayload.messages)
-          ) {
-            requestPayload.messages = ensureThinkingBeforeToolUseInMessages(
-              requestPayload.messages,
-              signatureSessionKey,
-            );
-          }
+            isClaudeThinking,
+            keepThinkingEnabled,
+            enableClaudePromptAutoCaching,
+          });
 
           // Step 3: Check if warmup needed (AFTER injection attempt)
           if (isClaudeThinking && keepThinkingEnabled) {
@@ -2277,7 +2279,22 @@ export function prepareAntigravityRequest(
     sessionId,
     toolDebugMissing,
     toolDebugSummary: toolDebugSummaries.slice(0, 20).join(" | "),
-    toolDebugPayload,
+    // Lazy: serialize the tools array only on first read (memoized), so the
+    // happy path never pays the JSON.stringify cost.
+    get toolDebugPayload(): string | undefined {
+      if (toolDebugTools === undefined) {
+        return undefined;
+      }
+      if (!toolDebugPayloadComputed) {
+        toolDebugPayloadComputed = true;
+        try {
+          toolDebugPayloadCache = JSON.stringify(toolDebugTools);
+        } catch {
+          toolDebugPayloadCache = undefined;
+        }
+      }
+      return toolDebugPayloadCache;
+    },
     needsSignedThinkingWarmup,
     headerStyle,
     thinkingRecoveryMessage,
@@ -2399,7 +2416,7 @@ export async function transformAntigravityResponse(
         cacheSignatures,
         displayedThinkingHashes:
           effectiveModel && isGemini3Model(effectiveModel)
-            ? sessionDisplayedThinkingHashes
+            ? getDisplayedThinkingHashes(sessionId)
             : undefined,
         // injectSyntheticThinking removed - keep_thinking now unified with debug via debugText
       },
@@ -2625,6 +2642,7 @@ export const __testExports = {
   sanitizeRequestPayloadForAntigravity,
   signatureCacheProjectKey,
   generateSyntheticProjectId,
+  getDisplayedThinkingHashes,
   MIN_SIGNATURE_LENGTH,
   transformSseLine,
   transformStreamingPayload,

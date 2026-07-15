@@ -189,6 +189,24 @@ export interface AccountMetadataV3 {
   enabled?: boolean;
   lastSwitchReason?: "rate-limit" | "initial" | "rotation";
   rateLimitResetTimes?: RateLimitStateV3;
+  /**
+   * Per-quota-key SET timestamps (key -> setAt epoch ms). Lets mergeAccountStorage
+   * order a limit against a clear (compare setAt vs clearedAt) so the LATEST mutation
+   * wins regardless of which writer's snapshot arrives last.
+   */
+  rateLimitSetTimes?: Record<string, number>;
+  /**
+   * Per-quota-key clear markers (key -> clearedAt epoch ms). Lets mergeAccountStorage
+   * distinguish "this pool's limit was intentionally cleared" from "this writer never
+   * touched this pool", so a clear is not silently resurrected from on-disk state.
+   */
+  clearedQuotaKeys?: Record<string, number>;
+  /**
+   * Per-quota-key GENERATION each tombstone cleared (key -> the cleared limit's setAt).
+   * A tombstone only supersedes a limit of that generation or older, so a stale process
+   * that passively expires an OLD limit cannot erase a NEWER limit written elsewhere.
+   */
+  clearedSetTimes?: Record<string, number>;
   coolingDownUntil?: number;
   cooldownReason?: CooldownReason;
   /** Per-account device fingerprint for rate limit mitigation */
@@ -400,6 +418,221 @@ async function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * How long a clear marker remains authoritative before it is pruned during merge.
+ * Kept in sync with RATE_LIMIT_CLEAR_TTL_MS in accounts.ts.
+ */
+const RATE_LIMIT_CLEAR_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Keep only finite numeric timestamps (drops corrupt/foreign values). */
+function numericTimestamp(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+interface ClearMarker {
+  clearedAt: number;
+  /** Generation (setAt) of the limit this tombstone cleared; undefined for legacy tombstones. */
+  clearedSetAt: number | undefined;
+}
+
+/**
+ * Filter a clear-marker map to the ACTIVE set: finite numbers within the TTL window,
+ * paired with the generation each tombstone cleared. Done ONCE up front so expired
+ * markers cannot delete a live limit and then vanish.
+ */
+function activeClearMarkers(
+  source: Record<string, number> | undefined,
+  setGenerations: Record<string, number> | undefined,
+  now: number,
+): Map<string, ClearMarker> {
+  const out = new Map<string, ClearMarker>();
+  if (!source) return out;
+  for (const [key, value] of Object.entries(source)) {
+    const clearedAt = numericTimestamp(value);
+    if (clearedAt === undefined) continue;
+    if (now - clearedAt > RATE_LIMIT_CLEAR_TTL_MS) continue;
+    out.set(key, { clearedAt, clearedSetAt: numericTimestamp(setGenerations?.[key]) });
+  }
+  return out;
+}
+
+type KeyMutation =
+  | { kind: "set"; at: number | undefined; reset: number }
+  | { kind: "clear"; at: number; clearedSetAt: number | undefined }
+  | { kind: "none" };
+
+/** Describe one writer's latest mutation for a single key (a live limit wins over a tombstone). */
+function sideMutation(
+  limit: number | undefined,
+  setAt: number | undefined,
+  clear: ClearMarker | undefined,
+): KeyMutation {
+  if (typeof limit === "number") {
+    return { kind: "set", at: setAt, reset: limit };
+  }
+  if (clear) {
+    return { kind: "clear", at: clear.clearedAt, clearedSetAt: clear.clearedSetAt };
+  }
+  return { kind: "none" };
+}
+
+/**
+ * Merge rate-limit state for a single account across two storage snapshots.
+ *
+ * Resolution is per key, by MUTATION ORDER, so the LATEST change wins regardless of
+ * which writer's snapshot arrives last:
+ * - Per-key basis, so two instances writing DIFFERENT pools on the same account both
+ *   survive — a whole-object replace would drop the other writer's pool.
+ * - Each side's latest mutation is a SET (with rateLimitSetTimes[key] = setAt) or a
+ *   CLEAR (with clearedQuotaKeys[key] = clearedAt and clearedSetTimes[key] = the
+ *   GENERATION it cleared). Reset time is never used for ordering (it is a future value).
+ * - A tombstone is GENERATION-VERSIONED: it only supersedes a limit whose setAt is
+ *   <= the generation it cleared. So a stale process that passively expires an OLD limit
+ *   (recording clearedAt = now) cannot erase a NEWER limit another process wrote after
+ *   that generation — the newer limit's setAt exceeds the cleared generation and wins.
+ * - Clear markers are TTL-filtered ONCE up front, so an expired tombstone can neither
+ *   delete a live limit nor be re-persisted. Surviving timestamps/generations are carried
+ *   forward so future merges stay orderable.
+ *
+ * Backward compatibility: when a generation or set timestamp is missing (older writer),
+ * mutations are unorderable and we fall back to INCOMING (the authoritative in-memory
+ * writer). For an unorderable SET-vs-SET conflict we keep incoming's reset and carry
+ * forward whichever valid setAt exists, so a legacy no-setAt disk limit cannot override
+ * a newer incoming set or discard its timestamp.
+ */
+function mergeRateLimitState(
+  existing: AccountMetadataV3,
+  incoming: AccountMetadataV3,
+): Pick<
+  AccountMetadataV3,
+  "rateLimitResetTimes" | "rateLimitSetTimes" | "clearedQuotaKeys" | "clearedSetTimes"
+> {
+  const now = Date.now();
+
+  const eLimits = existing.rateLimitResetTimes ?? {};
+  const iLimits = incoming.rateLimitResetTimes ?? {};
+  const eSet = existing.rateLimitSetTimes ?? {};
+  const iSet = incoming.rateLimitSetTimes ?? {};
+  const eClear = activeClearMarkers(existing.clearedQuotaKeys, existing.clearedSetTimes, now);
+  const iClear = activeClearMarkers(incoming.clearedQuotaKeys, incoming.clearedSetTimes, now);
+
+  const keys = new Set<string>([
+    ...Object.keys(eLimits),
+    ...Object.keys(iLimits),
+    ...eClear.keys(),
+    ...iClear.keys(),
+  ]);
+
+  const mergedLimits: RateLimitStateV3 = {};
+  const mergedSet: Record<string, number> = {};
+  const mergedCleared: Record<string, number> = {};
+  const mergedClearedSet: Record<string, number> = {};
+
+  for (const key of keys) {
+    const eMut = sideMutation(numericTimestamp(eLimits[key]), numericTimestamp(eSet[key]), eClear.get(key));
+    const iMut = sideMutation(numericTimestamp(iLimits[key]), numericTimestamp(iSet[key]), iClear.get(key));
+
+    const winner = resolveKeyMutation(eMut, iMut);
+    if (winner.kind === "set") {
+      mergedLimits[key] = winner.reset;
+      if (winner.at !== undefined) {
+        mergedSet[key] = winner.at;
+      }
+    } else if (winner.kind === "clear") {
+      mergedCleared[key] = winner.at;
+      if (winner.clearedSetAt !== undefined) {
+        mergedClearedSet[key] = winner.clearedSetAt;
+      }
+    }
+  }
+
+  return {
+    rateLimitResetTimes: mergedLimits,
+    rateLimitSetTimes: Object.keys(mergedSet).length > 0 ? mergedSet : undefined,
+    clearedQuotaKeys: Object.keys(mergedCleared).length > 0 ? mergedCleared : undefined,
+    clearedSetTimes: Object.keys(mergedClearedSet).length > 0 ? mergedClearedSet : undefined,
+  };
+}
+
+/**
+ * Pick the winning mutation for a key.
+ *
+ * Unifying rule: a mutation is VERSIONED when it carries the timestamp needed to order
+ * it — a SET with setAt, or a CLEAR with clearedSetAt (the generation it cleared).
+ * - Both versioned → order precisely (generation/timestamp compare).
+ * - Exactly one versioned → the VERSIONED side wins; the unversioned side cannot prove
+ *   it saw the other's generation, so it must not override.
+ * - Neither versioned → fall back to direction: incoming (authoritative writer) wins.
+ */
+function resolveKeyMutation(existing: KeyMutation, incoming: KeyMutation): KeyMutation {
+  if (existing.kind === "none") return incoming;
+  if (incoming.kind === "none") return existing;
+
+  if (existing.kind === "set" && incoming.kind === "set") {
+    return resolveSetVsSet(existing, incoming);
+  }
+
+  if (existing.kind === "clear" && incoming.kind === "clear") {
+    // Both cleared → still cleared. Keep the richer marker (latest clear, newest generation).
+    return {
+      kind: "clear",
+      at: Math.max(existing.at, incoming.at),
+      clearedSetAt: maxDefined(existing.clearedSetAt, incoming.clearedSetAt),
+    };
+  }
+
+  // One SET, one CLEAR.
+  const set = (existing.kind === "set" ? existing : incoming) as Extract<KeyMutation, { kind: "set" }>;
+  const clear = (existing.kind === "clear" ? existing : incoming) as Extract<KeyMutation, { kind: "clear" }>;
+  const setVersioned = set.at !== undefined;
+  const clearVersioned = clear.clearedSetAt !== undefined;
+
+  if (setVersioned && clearVersioned) {
+    // Generation-versioned: a clear only supersedes a limit of the generation it cleared
+    // or older. A newer generation (setAt > clearedSetAt) is a limit the clear never saw.
+    return set.at! > clear.clearedSetAt! ? set : clear;
+  }
+
+  if (setVersioned !== clearVersioned) {
+    // Exactly one side is versioned → it wins. An unversioned clear cannot erase a
+    // versioned set (it can't prove it cleared that generation), and vice versa.
+    return setVersioned ? set : clear;
+  }
+
+  // Neither versioned → direction-based: incoming (authoritative in-memory writer) wins.
+  return incoming;
+}
+
+/**
+ * Resolve a SET-vs-SET conflict.
+ * - Both versioned → latest setAt wins (ties → incoming).
+ * - Exactly one versioned → the VERSIONED set wins outright, reset AND setAt together
+ *   (never mix a legacy reset with the other side's timestamp).
+ * - Neither versioned → incoming (authoritative) wins.
+ */
+function resolveSetVsSet(
+  existing: Extract<KeyMutation, { kind: "set" }>,
+  incoming: Extract<KeyMutation, { kind: "set" }>,
+): KeyMutation {
+  const existingVersioned = existing.at !== undefined;
+  const incomingVersioned = incoming.at !== undefined;
+
+  if (existingVersioned && incomingVersioned) {
+    return incoming.at! >= existing.at! ? incoming : existing;
+  }
+  if (existingVersioned !== incomingVersioned) {
+    return existingVersioned ? existing : incoming;
+  }
+  return incoming;
+}
+
+/** Return the larger of two optional numbers, or whichever is defined. */
+function maxDefined(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return Math.max(a, b);
+}
+
 function mergeAccountStorage(
   existing: AccountStorageV4,
   incoming: AccountStorageV4,
@@ -426,10 +659,7 @@ function mergeAccountStorage(
           // Preserve manually configured projectId/managedProjectId if not in incoming
           projectId: acc.projectId ?? existingAcc.projectId,
           managedProjectId: acc.managedProjectId ?? existingAcc.managedProjectId,
-          rateLimitResetTimes: {
-            ...existingAcc.rateLimitResetTimes,
-            ...acc.rateLimitResetTimes,
-          },
+          ...mergeRateLimitState(existingAcc, acc),
           lastUsed: Math.max(existingAcc.lastUsed || 0, acc.lastUsed || 0),
         });
       } else {

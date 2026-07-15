@@ -31,6 +31,7 @@ const {
   hasToolUseInMessages,
   hasSignedThinkingInMessages,
   generateSyntheticProjectId,
+  getDisplayedThinkingHashes,
   MIN_SIGNATURE_LENGTH,
   transformStreamingPayload,
   createStreamingTransformer,
@@ -778,6 +779,70 @@ it("removes API key headers", () => {
         mockProjectId
       );
       expect(result.streaming).toBe(false);
+    });
+
+    // Finding #8: lock in current wrapped-branch behavior (project+request shape).
+    // The wrapped branch sets the model, attaches a stable sessionId, and
+    // intentionally SKIPS JSON-schema cleaning / tool hardening on request.tools.
+    it("preserves wrapper, sets model, and attaches a stable sessionId (wrapped Claude)", () => {
+      const wrappedBody = {
+        project: "projects/my-proj",
+        request: {
+          contents: [{ role: "user", parts: [{ text: "Hi" }] }],
+        },
+      };
+      const result = prepareAntigravityRequest(
+        "https://generativelanguage.googleapis.com/v1beta/models/claude-3-7-sonnet:generateContent",
+        { method: "POST", body: JSON.stringify(wrappedBody) },
+        mockAccessToken,
+        mockProjectId,
+      );
+
+      const parsed = JSON.parse(result.init.body as string);
+      // Wrapper structure preserved (not converted to unwrapped).
+      expect(parsed.project).toBe("projects/my-proj");
+      expect(parsed.request).toBeDefined();
+      // Model is stamped onto the wrapped body and matches effectiveModel.
+      expect(typeof parsed.model).toBe("string");
+      expect(parsed.model).toBe(result.effectiveModel);
+      // A stable session id is attached to the inner request and surfaced on the result.
+      expect(typeof result.sessionId).toBe("string");
+      expect(parsed.request.sessionId).toBe(result.sessionId);
+    });
+
+    it("does NOT clean tool JSON schemas in the wrapped branch", () => {
+      // A `const` keyword is normally rewritten to enum by cleanJSONSchemaForAntigravity.
+      // The wrapped branch skips schema cleaning, so it must pass through unchanged.
+      const wrappedBody = {
+        project: "my-project",
+        request: {
+          contents: [{ role: "user", parts: [{ text: "Hi" }] }],
+          tools: [
+            {
+              functionDeclarations: [
+                {
+                  name: "do_thing",
+                  parameters: {
+                    type: "object",
+                    properties: { mode: { const: "fast" } },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+      const result = prepareAntigravityRequest(
+        "https://generativelanguage.googleapis.com/v1beta/models/claude-3-7-sonnet:generateContent",
+        { method: "POST", body: JSON.stringify(wrappedBody) },
+        mockAccessToken,
+        mockProjectId,
+      );
+
+      const parsed = JSON.parse(result.init.body as string);
+      const params =
+        parsed.request.tools[0].functionDeclarations[0].parameters;
+      expect(params.properties.mode.const).toBe("fast");
     });
 
     it("does not add Claude auto-caching to wrapped request by default", () => {
@@ -1590,5 +1655,44 @@ describe("signatureCacheProjectKey (Defect 2: project-independent key for Gemini
   it("preserves the project component for Claude (unchanged partitioning)", () => {
     expect(signatureCacheProjectKey("claude-opus-4-6-thinking", "project-A")).toBe("project-A");
     expect(signatureCacheProjectKey("gemini-2.5-pro", "project-A")).toBe("project-A");
+  });
+});
+
+// Finding #3: per-session thinking-dedup state must be scoped by sessionId so
+// identical thinking text in a SECOND session is not cross-suppressed, and the
+// map stays bounded (old sessions evicted FIFO).
+describe("getDisplayedThinkingHashes (per-session dedup scoping)", () => {
+  it("returns the same Set instance for the same sessionId", () => {
+    const a = getDisplayedThinkingHashes("session-A");
+    const b = getDisplayedThinkingHashes("session-A");
+    expect(a).toBe(b);
+  });
+
+  it("returns distinct Sets for different sessions (no cross-session sharing)", () => {
+    const a = getDisplayedThinkingHashes("session-one");
+    const b = getDisplayedThinkingHashes("session-two");
+    expect(a).not.toBe(b);
+
+    // A hash displayed in session-one must NOT suppress the same text in session-two.
+    a!.add("hash-xyz");
+    expect(a!.has("hash-xyz")).toBe(true);
+    expect(b!.has("hash-xyz")).toBe(false);
+  });
+
+  it("returns undefined when no sessionId is available", () => {
+    expect(getDisplayedThinkingHashes(undefined)).toBeUndefined();
+    expect(getDisplayedThinkingHashes("")).toBeUndefined();
+  });
+
+  it("evicts oldest sessions once the cap is exceeded (bounded memory)", () => {
+    // Insert well beyond the cap (50); the first-seen session must be evicted.
+    const first = getDisplayedThinkingHashes("evict-session-0");
+    first!.add("marker");
+    for (let i = 1; i <= 60; i++) {
+      getDisplayedThinkingHashes(`evict-session-${i}`);
+    }
+    // Re-fetching the evicted session yields a fresh empty Set.
+    const refetched = getDisplayedThinkingHashes("evict-session-0");
+    expect(refetched!.has("marker")).toBe(false);
   });
 });

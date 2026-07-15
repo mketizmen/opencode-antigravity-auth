@@ -139,19 +139,49 @@ function aggregateQuota(models?: Record<string, FetchAvailableModelEntry>): Quot
     const resetTime = quotaInfo?.resetTime;
     const resetTimestamp = parseResetTime(resetTime);
 
+    // Only report a reset time we can actually parse; keep it coupled to the
+    // model whose remainingFraction we display.
+    const validResetTime = resetTimestamp !== null ? resetTime : undefined;
+
     totalCount += 1;
 
     const existing = groups[group];
     const nextCount = (existing?.modelCount ?? 0) + 1;
-    const useCurrentQuota =
+
+    // Keep remainingFraction and resetTime coupled to the SAME model. The
+    // representative model for a group is the one with the highest remaining
+    // fraction; when a model wins that comparison we take its resetTime too.
+    let nextRemaining = existing?.remainingFraction;
+    let nextResetTime = existing?.resetTime;
+
+    if (existing === undefined) {
+      // First model in the group establishes the baseline coupled pair.
+      nextRemaining = remainingFraction;
+      nextResetTime = validResetTime;
+    } else if (
       remainingFraction !== undefined &&
-      (existing?.remainingFraction === undefined || remainingFraction > existing.remainingFraction);
-    const nextRemaining = useCurrentQuota ? remainingFraction : existing?.remainingFraction;
-    const existingResetTimestamp = parseResetTime(existing?.resetTime);
-    const nextResetTime =
-      resetTimestamp !== null && (existingResetTimestamp === null || resetTimestamp < existingResetTimestamp)
-        ? resetTime
-        : existing?.resetTime;
+      (existing.remainingFraction === undefined || remainingFraction > existing.remainingFraction)
+    ) {
+      // This model has strictly more remaining quota — it becomes representative.
+      nextRemaining = remainingFraction;
+      nextResetTime = validResetTime;
+    } else if (
+      remainingFraction !== undefined &&
+      existing.remainingFraction !== undefined &&
+      remainingFraction === existing.remainingFraction
+    ) {
+      // Tie on remaining fraction: break deterministically by keeping the
+      // earliest valid reset time so we never report a far-future reset when an
+      // equally-drained sibling model resets sooner.
+      const existingResetTimestamp = parseResetTime(existing.resetTime);
+      if (
+        resetTimestamp !== null &&
+        (existingResetTimestamp === null || resetTimestamp < existingResetTimestamp)
+      ) {
+        nextResetTime = validResetTime;
+      }
+    }
+    // Otherwise keep the existing coupled (remainingFraction, resetTime) pair.
 
     groups[group] = {
       remainingFraction: nextRemaining,
@@ -298,93 +328,154 @@ function applyAccountUpdates(account: AccountMetadataV3, auth: OAuthAuthDetails)
   return changed ? updated : undefined;
 }
 
+// Max accounts to check simultaneously. Bounded to avoid bursting the provider
+// with a token refresh + project-context resolution + quota fetch per account.
+const QUOTA_CHECK_CONCURRENCY = 3;
+
+/**
+ * Run an async mapper over items with a bounded number of concurrent workers.
+ * Results preserve the original item order regardless of completion order.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  if (items.length === 0) {
+    return results;
+  }
+
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  let cursor = 0;
+
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) {
+        break;
+      }
+      const item = items[index];
+      if (item === undefined) {
+        continue;
+      }
+      results[index] = await fn(item, index);
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
+/**
+ * Fetch and aggregate quota for a single account.
+ * Never throws — failures are captured in the returned result's status/error.
+ */
+async function checkSingleAccountQuota(
+  account: AccountMetadataV3,
+  index: number,
+  client: PluginClient,
+  providerId: string,
+): Promise<AccountQuotaResult> {
+  const disabled = account.enabled === false;
+
+  let auth = buildAuthFromAccount(account);
+
+  try {
+    if (accessTokenExpired(auth)) {
+      const refreshed = await refreshAccessToken(auth, client, providerId);
+      if (!refreshed) {
+        throw new Error("Token refresh failed");
+      }
+      auth = refreshed;
+    }
+
+    const projectContext = await ensureProjectContext(auth);
+    auth = projectContext.auth;
+    const updatedAccount = applyAccountUpdates(account, auth);
+
+    let quotaResult: QuotaSummary;
+    let geminiCliQuotaResult: GeminiCliQuotaSummary;
+
+    // Fetch both Antigravity and Gemini CLI quotas in parallel
+    const [antigravityResponse, geminiCliResponse] = await Promise.all([
+      fetchAvailableModels(auth.access ?? "", projectContext.effectiveProjectId)
+        .catch((): FetchAvailableModelsResponse => ({ models: undefined })),
+      fetchGeminiCliQuota(auth.access ?? "", projectContext.effectiveProjectId),
+    ]);
+
+    // Process Antigravity quota
+    if (antigravityResponse.models === undefined) {
+      quotaResult = {
+        groups: {},
+        modelCount: 0,
+        error: "Failed to fetch Antigravity quota",
+      };
+    } else {
+      quotaResult = aggregateQuota(antigravityResponse.models);
+    }
+
+    // Process Gemini CLI quota
+    geminiCliQuotaResult = aggregateGeminiCliQuota(geminiCliResponse);
+    if (geminiCliResponse.buckets === undefined || geminiCliResponse.buckets.length === 0) {
+      geminiCliQuotaResult.error = geminiCliQuotaResult.models.length === 0
+        ? "No Gemini CLI quota available"
+        : undefined;
+    }
+
+    // Log quota status for each family
+    for (const [family, groupQuota] of Object.entries(quotaResult.groups)) {
+      const remainingPercent = (groupQuota.remainingFraction ?? 0) * 100;
+      logQuotaStatus(account.email, index, remainingPercent, family);
+    }
+
+    return {
+      index,
+      email: account.email,
+      status: "ok",
+      disabled,
+      quota: quotaResult,
+      geminiCliQuota: geminiCliQuotaResult,
+      updatedAccount,
+    };
+  } catch (error) {
+    logQuotaFetch(
+      "error",
+      undefined,
+      `account=${account.email ?? index} error=${error instanceof Error ? error.message : String(error)}`,
+    );
+    return {
+      index,
+      email: account.email,
+      status: "error",
+      disabled,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 export async function checkAccountsQuota(
   accounts: AccountMetadataV3[],
   client: PluginClient,
   providerId = ANTIGRAVITY_PROVIDER_ID,
 ): Promise<AccountQuotaResult[]> {
-  const results: AccountQuotaResult[] = [];
-  
   logQuotaFetch("start", accounts.length);
 
-  for (const [index, account] of accounts.entries()) {
-    const disabled = account.enabled === false;
+  // Check accounts with bounded concurrency; results stay ordered by index.
+  const results = await mapWithConcurrency(accounts, QUOTA_CHECK_CONCURRENCY, (account, index) =>
+    checkSingleAccountQuota(account, index, client, providerId),
+  );
 
-    let auth = buildAuthFromAccount(account);
-
-    try {
-      if (accessTokenExpired(auth)) {
-        const refreshed = await refreshAccessToken(auth, client, providerId);
-        if (!refreshed) {
-          throw new Error("Token refresh failed");
-        }
-        auth = refreshed;
-      }
-
-      const projectContext = await ensureProjectContext(auth);
-      auth = projectContext.auth;
-      const updatedAccount = applyAccountUpdates(account, auth);
-
-      let quotaResult: QuotaSummary;
-      let geminiCliQuotaResult: GeminiCliQuotaSummary;
-      
-      // Fetch both Antigravity and Gemini CLI quotas in parallel
-      const [antigravityResponse, geminiCliResponse] = await Promise.all([
-        fetchAvailableModels(auth.access ?? "", projectContext.effectiveProjectId)
-          .catch((): FetchAvailableModelsResponse => ({ models: undefined })),
-        fetchGeminiCliQuota(auth.access ?? "", projectContext.effectiveProjectId),
-      ]);
-
-      // Process Antigravity quota
-      if (antigravityResponse.models === undefined) {
-        quotaResult = {
-          groups: {},
-          modelCount: 0,
-          error: "Failed to fetch Antigravity quota",
-        };
-      } else {
-        quotaResult = aggregateQuota(antigravityResponse.models);
-      }
-
-      // Process Gemini CLI quota
-      geminiCliQuotaResult = aggregateGeminiCliQuota(geminiCliResponse);
-      if (geminiCliResponse.buckets === undefined || geminiCliResponse.buckets.length === 0) {
-        geminiCliQuotaResult.error = geminiCliQuotaResult.models.length === 0 
-          ? "No Gemini CLI quota available" 
-          : undefined;
-      }
-
-      results.push({
-        index,
-        email: account.email,
-        status: "ok",
-        disabled,
-        quota: quotaResult,
-        geminiCliQuota: geminiCliQuotaResult,
-        updatedAccount,
-      });
-      
-      // Log quota status for each family
-      for (const [family, groupQuota] of Object.entries(quotaResult.groups)) {
-        const remainingPercent = (groupQuota.remainingFraction ?? 0) * 100;
-        logQuotaStatus(account.email, index, remainingPercent, family);
-      }
-    } catch (error) {
-      results.push({
-        index,
-        email: account.email,
-        status: "error",
-        disabled,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      logQuotaFetch("error", undefined, `account=${account.email ?? index} error=${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
-  logQuotaFetch("complete", accounts.length, `ok=${results.filter(r => r.status === "ok").length} errors=${results.filter(r => r.status === "error").length}`);
+  logQuotaFetch(
+    "complete",
+    accounts.length,
+    `ok=${results.filter((r) => r.status === "ok").length} errors=${results.filter((r) => r.status === "error").length}`,
+  );
   return results;
 }
 
 export const __testExports = {
   aggregateQuota,
+  mapWithConcurrency,
 }

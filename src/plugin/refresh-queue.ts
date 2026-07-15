@@ -39,6 +39,26 @@ export const DEFAULT_PROACTIVE_REFRESH_CONFIG: ProactiveRefreshConfig = {
   checkIntervalSeconds: 300, // 5 minutes
 };
 
+/**
+ * Number of consecutive proactive-refresh failures before an account is put
+ * into a backoff window. Prevents a revoked-but-unexpired token from retrying
+ * every check cycle forever.
+ */
+const MAX_CONSECUTIVE_REFRESH_FAILURES = 3;
+
+/** Base backoff window applied once an account crosses the failure threshold. */
+const REFRESH_BACKOFF_BASE_MS = 15 * 60 * 1000; // 15 minutes
+
+/** Upper bound on the escalating backoff window. */
+const REFRESH_BACKOFF_MAX_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+/** Per-account failure/backoff bookkeeping, keyed by a stable account identifier. */
+interface RefreshFailureState {
+  consecutiveFailures: number;
+  /** Epoch ms until which proactive refresh should be skipped for this account. */
+  skipUntil: number;
+}
+
 /** State for tracking refresh operations */
 interface RefreshQueueState {
   isRunning: boolean;
@@ -63,7 +83,13 @@ export class ProactiveRefreshQueue {
   private readonly client: PluginClient;
   private readonly providerId: string;
   private accountManager: AccountManager | null = null;
-  
+
+  /**
+   * Per-account failure tracking, keyed by a stable identifier (email or refresh
+   * token) rather than array index, so it survives account list reordering.
+   */
+  private readonly failureTracking = new Map<string, RefreshFailureState>();
+
   private state: RefreshQueueState = {
     isRunning: false,
     intervalHandle: null,
@@ -144,6 +170,82 @@ export class ProactiveRefreshQueue {
   }
 
   /**
+   * Derive a stable identifier for an account for failure tracking.
+   * Prefers email, falls back to refresh token, then to index.
+   */
+  private getAccountKey(account: ManagedAccount): string {
+    return account.email ?? account.parts?.refreshToken ?? `index:${account.index}`;
+  }
+
+  /**
+   * Drop failure-tracking entries that no longer correspond to any current
+   * account identity. Accounts can be removed (or churned via manager
+   * replacement) after failing; without pruning, their email/token keys would
+   * linger in this long-lived map forever. Cheap O(accounts + entries) set-diff.
+   */
+  private pruneFailureTracking(): void {
+    if (this.failureTracking.size === 0 || !this.accountManager) {
+      return;
+    }
+    const liveKeys = new Set(
+      this.accountManager.getAccounts().map((account) => this.getAccountKey(account)),
+    );
+    for (const key of this.failureTracking.keys()) {
+      if (!liveKeys.has(key)) {
+        this.failureTracking.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Whether the account is currently in a proactive-refresh backoff window.
+   */
+  private isInRefreshBackoff(account: ManagedAccount, now: number): boolean {
+    const state = this.failureTracking.get(this.getAccountKey(account));
+    return state !== undefined && state.skipUntil > now;
+  }
+
+  /**
+   * Clear failure tracking for an account after a successful refresh.
+   *
+   * A successful refresh may rotate the account's refresh token. For email-less
+   * accounts the tracking key IS the refresh token, so the key derived after the
+   * update differs from the one the failure was recorded under. Pass the
+   * pre-update key so both the old and new keys are cleared and no stale entry
+   * is orphaned.
+   */
+  private recordRefreshSuccess(account: ManagedAccount, previousKey?: string): void {
+    this.failureTracking.delete(this.getAccountKey(account));
+    if (previousKey !== undefined) {
+      this.failureTracking.delete(previousKey);
+    }
+  }
+
+  /**
+   * Record a failed proactive refresh. After the threshold is crossed, the
+   * account is skipped for an escalating backoff window.
+   */
+  private recordRefreshFailure(account: ManagedAccount, now: number): void {
+    const key = this.getAccountKey(account);
+    const state = this.failureTracking.get(key) ?? { consecutiveFailures: 0, skipUntil: 0 };
+    state.consecutiveFailures += 1;
+
+    if (state.consecutiveFailures >= MAX_CONSECUTIVE_REFRESH_FAILURES) {
+      const exponent = state.consecutiveFailures - MAX_CONSECUTIVE_REFRESH_FAILURES;
+      const backoffMs = Math.min(REFRESH_BACKOFF_MAX_MS, REFRESH_BACKOFF_BASE_MS * 2 ** exponent);
+      state.skipUntil = now + backoffMs;
+      log.warn("Account entering proactive-refresh backoff", {
+        accountIndex: account.index,
+        email: account.email ?? "unknown",
+        consecutiveFailures: state.consecutiveFailures,
+        backoffMinutes: Math.round(backoffMs / 60000),
+      });
+    }
+
+    this.failureTracking.set(key, state);
+  }
+
+  /**
    * Perform a single refresh check iteration.
    * This is called periodically by the background interval.
    */
@@ -161,6 +263,9 @@ export class ProactiveRefreshQueue {
     this.state.lastCheckTime = Date.now();
 
     try {
+      // Drop tracking for accounts that were removed since the last check.
+      this.pruneFailureTracking();
+
       const accountsToRefresh = this.getAccountsNeedingRefresh();
 
       if (accountsToRefresh.length === 0) {
@@ -176,12 +281,26 @@ export class ProactiveRefreshQueue {
           break;
         }
 
+        // Skip accounts that are in a failure backoff window. This prevents a
+        // revoked-but-unexpired token from being retried every cycle forever.
+        if (this.isInRefreshBackoff(account, Date.now())) {
+          log.debug("Skipping account in proactive-refresh backoff", {
+            accountIndex: account.index,
+            email: account.email ?? "unknown",
+          });
+          continue;
+        }
+
         try {
           const auth = this.accountManager.toAuthDetails(account);
+          // Capture the tracking key BEFORE updateFromAuth, since a successful
+          // refresh can rotate the refresh token (the key for email-less accounts).
+          const keyBeforeUpdate = this.getAccountKey(account);
           const refreshed = await this.refreshToken(auth, account);
 
           if (refreshed) {
             this.accountManager.updateFromAuth(account, refreshed);
+            this.recordRefreshSuccess(account, keyBeforeUpdate);
             this.state.refreshCount++;
             this.state.lastRefreshTime = Date.now();
 
@@ -191,9 +310,19 @@ export class ProactiveRefreshQueue {
             } catch {
               // Non-fatal - token is refreshed in memory
             }
+          } else {
+            // A falsy result means the refresh did not succeed (e.g. a revoked
+            // token). Count it toward the backoff threshold.
+            this.state.errorCount++;
+            this.recordRefreshFailure(account, Date.now());
+            log.warn("Proactive refresh returned no token", {
+              accountIndex: account.index,
+              email: account.email ?? "unknown",
+            });
           }
         } catch (error) {
           this.state.errorCount++;
+          this.recordRefreshFailure(account, Date.now());
           // Log but don't throw - continue with other accounts
           log.warn("Failed to refresh account", {
             accountIndex: account.index,
