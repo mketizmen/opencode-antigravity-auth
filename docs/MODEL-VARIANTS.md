@@ -50,14 +50,15 @@ The plugin accepts different variant formats depending on the model family:
 
 Gemini 3 models use string-based thinking levels. Available levels differ by model:
 
-| Level | Flash | Pro | Description |
-|-------|-------|-----|-------------|
-| `minimal` | ✅ | ❌ | Minimal thinking, lowest latency |
-| `low` | ✅ | ✅ | Light thinking |
-| `medium` | ✅ | ❌ | Balanced thinking |
-| `high` | ✅ | ✅ | Maximum thinking (default) |
+| Level | 3/3.5 Flash | 3.6 Flash | 3.5 Flash-Lite | Pro | Description |
+|-------|-------------|-----------|----------------|-----|-------------|
+| `minimal` | ✅ | ❌ | ✅ | ❌ | Minimal thinking, lowest latency |
+| `low` | ✅ | Antigravity only | ✅ | ✅ | Light thinking |
+| `medium` | ✅ | ✅ | ✅ | ❌ | Balanced thinking |
+| `high` | ✅ | ✅ | ✅ | ✅ | Maximum thinking |
 
 > **Note:** The API rejects invalid levels (e.g., `"minimal"` on Pro). Configure variants accordingly.
+> Defaults are model-specific: Gemini 3.6 Flash uses `medium`, Gemini 3.5 Flash-Lite uses `minimal`, and existing plugin models retain their current defaults.
 
 ### Gemini 3 Pro Example
 

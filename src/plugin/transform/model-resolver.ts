@@ -43,7 +43,8 @@ export const GEMINI_3_THINKING_LEVELS = [
  * - Claude non-thinking: claude-{model} (no -thinking suffix)
  */
 export const MODEL_ALIASES: Record<string, string> = {
-  "gemini-flash-latest": "gemini-3.5-flash",
+  "gemini-flash-latest": "gemini-3.6-flash",
+  "gemini-flash-lite-latest": "gemini-3.5-flash-lite",
 
   // Gemini 3 variants - for Gemini CLI only (tier stripped, thinkingLevel used)
   // For Antigravity, these are bypassed and full model name is kept
@@ -74,6 +75,15 @@ const GEMINI_35_FLASH_REGEX =
   /^gemini-3\.5-flash(?:-(minimal|low|medium|high))?$/i;
 const GEMINI_35_FLASH_LOW_MODEL = "gemini-3.5-flash-low";
 const GEMINI_35_FLASH_HIGH_MODEL = "gemini-3-flash-agent";
+const GEMINI_36_FLASH_REGEX =
+  /^gemini-3\.6-flash(?:-(low|medium|high))?$/i;
+const GEMINI_36_FLASH_MODELS = {
+  low: "gemini-3.6-flash-low",
+  medium: "gemini-3.6-flash-medium",
+  high: "gemini-3.6-flash-high",
+} as const;
+const GEMINI_PUBLIC_ONLY_REGEX =
+  /^(?:gemini-3\.5-flash-lite(?:-(?:minimal|low|medium|high))?|gemini-flash-lite-latest)$/i;
 /**
  * Dotted-minor Gemini generations (gemini-3.1, gemini-3.5, ...) use BARE model
  * names on the Gemini CLI backend, unlike the legacy 3.0 line (gemini-3-pro) which
@@ -176,11 +186,48 @@ export function resolveAntigravityGemini35FlashBackendModel(
 }
 
 /**
+ * Antigravity exposes Gemini 3.6 Flash as separate tier-specific backend ids.
+ * The public Gemini API and Gemini CLI continue to use the bare stable id.
+ */
+export function resolveAntigravityGemini36FlashBackendModel(
+  model: string,
+  thinkingLevel?: string,
+): string | undefined {
+  const modelWithoutQuota = model.replace(QUOTA_PREFIX_REGEX, "");
+  const match = modelWithoutQuota.match(GEMINI_36_FLASH_REGEX);
+  if (!match) {
+    return undefined;
+  }
+
+  const level = (thinkingLevel ?? match[1] ?? "medium").toLowerCase();
+  if (level !== "low" && level !== "medium" && level !== "high") {
+    return undefined;
+  }
+  return GEMINI_36_FLASH_MODELS[level];
+}
+
+export function getDefaultGemini3ThinkingLevel(model: string): string {
+  const normalized = model.toLowerCase().replace(QUOTA_PREFIX_REGEX, "");
+  if (/^gemini-3\.6-flash(?:-|$)/.test(normalized)) {
+    return "medium";
+  }
+  if (/^gemini-3\.5-flash-lite(?:-|$)/.test(normalized)) {
+    return "minimal";
+  }
+  return "low";
+}
+
+/** Models released on the public Gemini API without a verified Antigravity route. */
+export function isGeminiPublicOnlyModel(model: string): boolean {
+  return GEMINI_PUBLIC_ONLY_REGEX.test(model.replace(QUOTA_PREFIX_REGEX, ""));
+}
+
+/**
  * Resolves a model name with optional tier suffix and quota prefix to its actual API model name
  * and corresponding thinking configuration.
  *
  * Quota routing:
- * - Default to Antigravity quota unless cli_first is enabled for Gemini models
+ * - Default to Antigravity quota unless cli_first is enabled or a model is public-only
  * - Fallback to Gemini CLI happens at account rotation level when Antigravity is exhausted
  * - "antigravity-" prefix marks explicit quota (no fallback allowed)
  * - Claude and image models always use Antigravity
@@ -210,13 +257,12 @@ export function resolveModelWithTier(
   const isImageModel = IMAGE_GENERATION_MODELS.test(modelWithoutQuota);
   const isClaudeModel = modelWithoutQuota.toLowerCase().includes("claude");
 
-  // All models default to Antigravity quota unless cli_first is enabled
+  // Models default to Antigravity unless they are public-only or cli_first is enabled.
   // Fallback to gemini-cli happens at the account rotation level when Antigravity is exhausted
   const preferGeminiCli =
-    options.cli_first === true &&
     !isAntigravity &&
-    !isImageModel &&
-    !isClaudeModel;
+    (isGeminiPublicOnlyModel(modelWithoutQuota) ||
+      (options.cli_first === true && !isImageModel && !isClaudeModel));
   const quotaPreference = preferGeminiCli
     ? ("gemini-cli" as const)
     : ("antigravity" as const);
@@ -235,9 +281,13 @@ export function resolveModelWithTier(
 
   let antigravityModel = modelWithoutQuota;
   if (skipAlias) {
+    const gemini36FlashBackendModel =
+      resolveAntigravityGemini36FlashBackendModel(modelWithoutQuota, tier);
     const gemini35FlashBackendModel =
       resolveAntigravityGemini35FlashBackendModel(modelWithoutQuota, tier);
-    if (gemini35FlashBackendModel) {
+    if (gemini36FlashBackendModel) {
+      antigravityModel = gemini36FlashBackendModel;
+    } else if (gemini35FlashBackendModel) {
       antigravityModel = gemini35FlashBackendModel;
     } else if (isGemini3Pro && !tier && !isImageModel) {
       antigravityModel = `${modelWithoutQuota}-low`;
@@ -276,7 +326,7 @@ export function resolveModelWithTier(
     if (isEffectiveGemini3) {
       return {
         actualModel: resolvedModel,
-        thinkingLevel: "low",
+        thinkingLevel: getDefaultGemini3ThinkingLevel(resolvedModel),
         isThinkingModel: true,
         quotaPreference,
         explicitQuota,

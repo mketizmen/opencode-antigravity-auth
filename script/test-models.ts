@@ -9,6 +9,8 @@ interface ModelTest {
 const MODELS: ModelTest[] = [
   // Gemini CLI (direct Google API)
   { model: "google/gemini-3-flash-preview", category: "gemini-cli" },
+  { model: "google/gemini-3.5-flash-lite", category: "gemini-cli" },
+  { model: "google/gemini-3.6-flash", category: "gemini-cli" },
   { model: "google/gemini-3-pro-preview", category: "gemini-cli" },
   { model: "google/gemini-2.5-pro", category: "gemini-cli" },
   { model: "google/gemini-2.5-flash", category: "gemini-cli" },
@@ -17,6 +19,7 @@ const MODELS: ModelTest[] = [
   { model: "google/antigravity-gemini-3-pro-low", category: "antigravity-gemini" },
   { model: "google/antigravity-gemini-3-pro-high", category: "antigravity-gemini" },
   { model: "google/antigravity-gemini-3-flash", category: "antigravity-gemini" },
+  { model: "google/antigravity-gemini-3.6-flash", category: "antigravity-gemini" },
 
   // Antigravity Claude
   { model: "google/antigravity-claude-sonnet-4-6", category: "antigravity-claude" },
@@ -101,7 +104,7 @@ Options:
 
 Examples:
   npx tsx script/test-models.ts --dry-run
-  npx tsx script/test-models.ts --model google/gemini-3-flash-preview
+  npx tsx script/test-models.ts --model google/gemini-3.6-flash
   npx tsx script/test-models.ts --category antigravity-claude
 `);
 }

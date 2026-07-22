@@ -247,6 +247,47 @@ export function isGemini3Model(model: string): boolean {
   return model.toLowerCase().includes("gemini-3");
 }
 
+const STRICT_SAMPLING_MODEL_REGEX =
+  /^gemini-(?:3\.6-flash(?:-(?:low|medium|high|tiered))?|3\.5-flash-lite)$/i;
+const DEPRECATED_SAMPLING_FIELDS = [
+  "temperature",
+  "topP",
+  "top_p",
+  "topK",
+  "top_k",
+  "candidateCount",
+  "candidate_count",
+] as const;
+
+/**
+ * Gemini 3.6 Flash and 3.5 Flash-Lite ignore deprecated sampling controls and
+ * reject candidate count. Remove them without affecting older Gemini models.
+ */
+export function sanitizeGeminiGenerationConfigForModel(
+  payload: RequestPayload,
+  model: string,
+): void {
+  const normalizedModel = model.replace(/^antigravity-/i, "");
+  if (!STRICT_SAMPLING_MODEL_REGEX.test(normalizedModel)) {
+    return;
+  }
+
+  const configs: unknown[] = [payload.generationConfig];
+  const extraBody = payload.extra_body ?? payload.extraBody;
+  if (extraBody && typeof extraBody === "object" && !Array.isArray(extraBody)) {
+    configs.push((extraBody as Record<string, unknown>).generationConfig);
+  }
+
+  for (const config of configs) {
+    if (!config || typeof config !== "object" || Array.isArray(config)) {
+      continue;
+    }
+    for (const field of DEPRECATED_SAMPLING_FIELDS) {
+      delete (config as Record<string, unknown>)[field];
+    }
+  }
+}
+
 /**
  * Check if a model is Gemini 2.5 (uses numeric thinkingBudget).
  */

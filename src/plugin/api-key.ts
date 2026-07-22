@@ -1,5 +1,12 @@
 import { extractVariantThinkingConfig } from "./request-helpers";
-import { applyGeminiTransforms, isGemini3Model, isImageGenerationModel, mapAntigravityModelToPublicApi, resolveModelForHeaderStyle } from "./transform";
+import {
+  applyGeminiTransforms,
+  isGemini3Model,
+  isImageGenerationModel,
+  mapAntigravityModelToPublicApi,
+  resolveModelForHeaderStyle,
+  sanitizeGeminiGenerationConfigForModel,
+} from "./transform";
 import { getPublicGeminiApiModelIds } from "./model-catalog";
 import type { AntigravityConfig } from "./config";
 import type { GeminiApiModel } from "./config/models";
@@ -489,6 +496,7 @@ function applyAgySdkGeminiBodyTransforms(payload: RequestPayload, model: string,
     ? payload.generationConfig
     : {};
   const extraBody = mergeExtraBody(payload);
+  sanitizeGeminiGenerationConfigForModel(payload, model);
   const variantConfig = extractVariantThinkingConfig(
     isRecord(payload.providerOptions) ? payload.providerOptions : undefined,
     generationConfig,

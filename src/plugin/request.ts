@@ -64,10 +64,13 @@ import {
   isImageGenerationModel,
   buildImageGenerationConfig,
   applyGeminiTransforms,
+  sanitizeGeminiGenerationConfigForModel,
 } from "./transform";
 import {
   resolveModelForHeaderStyle,
   resolveAntigravityGemini35FlashBackendModel,
+  resolveAntigravityGemini36FlashBackendModel,
+  getDefaultGemini3ThinkingLevel,
   isClaudeModel,
   isClaudeThinkingModel,
   CLAUDE_THINKING_MAX_OUTPUT_TOKENS,
@@ -1030,7 +1033,8 @@ function ensureDefaultGemini3ThinkingLevel(
       : {};
 
   if (typeof thinkingConfig.thinkingLevel !== "string") {
-    thinkingConfig.thinkingLevel = thinkingLevel ?? "low";
+    thinkingConfig.thinkingLevel =
+      thinkingLevel ?? getDefaultGemini3ThinkingLevel(effectiveModel);
   }
   if (typeof thinkingConfig.includeThoughts !== "boolean") {
     thinkingConfig.includeThoughts = true;
@@ -1340,12 +1344,20 @@ export function prepareAntigravityRequest(
         }
 
         if (headerStyle === "antigravity") {
+          const gemini36FlashBackendModel =
+            resolveAntigravityGemini36FlashBackendModel(
+              effectiveModel,
+              tierThinkingLevel,
+            );
           const gemini35FlashBackendModel =
             resolveAntigravityGemini35FlashBackendModel(
               effectiveModel,
               tierThinkingLevel,
             );
-          if (gemini35FlashBackendModel) {
+          if (gemini36FlashBackendModel) {
+            effectiveModel = gemini36FlashBackendModel;
+            wrappedBody.model = gemini36FlashBackendModel;
+          } else if (gemini35FlashBackendModel) {
             effectiveModel = gemini35FlashBackendModel;
             wrappedBody.model = gemini35FlashBackendModel;
           }
@@ -1377,6 +1389,10 @@ export function prepareAntigravityRequest(
           // Use stable session ID for signature caching across multi-turn conversations
           (req as any).sessionId = signatureSessionKey;
           stripInjectedDebugFromRequestPayload(req as Record<string, unknown>);
+          sanitizeGeminiGenerationConfigForModel(
+            req as Record<string, unknown>,
+            effectiveModel,
+          );
           ensureDefaultGemini3ThinkingLevel(
             req as Record<string, unknown>,
             effectiveModel,
@@ -1472,12 +1488,19 @@ export function prepareAntigravityRequest(
         }
 
         if (headerStyle === "antigravity") {
+          const gemini36FlashBackendModel =
+            resolveAntigravityGemini36FlashBackendModel(
+              effectiveModel,
+              tierThinkingLevel,
+            );
           const gemini35FlashBackendModel =
             resolveAntigravityGemini35FlashBackendModel(
               effectiveModel,
               tierThinkingLevel,
             );
-          if (gemini35FlashBackendModel) {
+          if (gemini36FlashBackendModel) {
+            effectiveModel = gemini36FlashBackendModel;
+          } else if (gemini35FlashBackendModel) {
             effectiveModel = gemini35FlashBackendModel;
           }
         }
@@ -2142,6 +2165,10 @@ export function prepareAntigravityRequest(
         // and re-plans the same step forever.
         const restoreGeminiThoughtSignatures =
           !isClaude && shouldCacheThinkingSignatures(effectiveModel);
+        sanitizeGeminiGenerationConfigForModel(
+          requestPayload,
+          effectiveModel,
+        );
         sanitizeRequestPayloadForAntigravity(
           requestPayload,
           restoreGeminiThoughtSignatures

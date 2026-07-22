@@ -7,6 +7,7 @@ import {
   buildGemini3ThinkingConfig,
   buildGemini25ThinkingConfig,
   buildImageGenerationConfig,
+  sanitizeGeminiGenerationConfigForModel,
   normalizeGeminiTools,
   applyGeminiTransforms,
   toGeminiSchema,
@@ -58,6 +59,52 @@ describe("transform/gemini", () => {
 
     it("returns false for empty string", () => {
       expect(isGeminiModel("")).toBe(false);
+    });
+  });
+
+  describe("sanitizeGeminiGenerationConfigForModel", () => {
+    it.each([
+      "gemini-3.6-flash",
+      "gemini-3.6-flash-medium",
+      "antigravity-gemini-3.6-flash-high",
+      "gemini-3.5-flash-lite",
+    ])("removes deprecated sampling fields for %s", (model) => {
+      const payload: RequestPayload = {
+        generationConfig: {
+          temperature: 0.7,
+          topP: 0.9,
+          top_k: 40,
+          candidateCount: 2,
+          maxOutputTokens: 1024,
+        },
+        extra_body: {
+          generationConfig: {
+            top_p: 0.8,
+            candidate_count: 3,
+            responseMimeType: "application/json",
+          },
+        },
+      };
+
+      sanitizeGeminiGenerationConfigForModel(payload, model);
+
+      expect(payload.generationConfig).toEqual({ maxOutputTokens: 1024 });
+      expect(
+        (payload.extra_body as Record<string, unknown>).generationConfig,
+      ).toEqual({ responseMimeType: "application/json" });
+    });
+
+    it("preserves sampling fields for older Gemini models", () => {
+      const payload: RequestPayload = {
+        generationConfig: { temperature: 0.7, topP: 0.9 },
+      };
+
+      sanitizeGeminiGenerationConfigForModel(payload, "gemini-3.5-flash");
+
+      expect(payload.generationConfig).toEqual({
+        temperature: 0.7,
+        topP: 0.9,
+      });
     });
   });
 
