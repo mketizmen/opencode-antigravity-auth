@@ -24,6 +24,9 @@ export {
   resolveModelWithVariant,
   resolveModelForHeaderStyle,
   resolveAntigravityGemini35FlashBackendModel,
+  resolveAntigravityGemini36FlashBackendModel,
+  getDefaultGemini3ThinkingLevel,
+  isGeminiPublicOnlyModel,
   getModelFamily,
   MODEL_ALIASES,
   THINKING_TIER_BUDGETS,
@@ -55,6 +58,7 @@ export {
   buildGemini3ThinkingConfig,
   buildGemini25ThinkingConfig,
   buildImageGenerationConfig,
+  sanitizeGeminiGenerationConfigForModel,
   normalizeGeminiTools,
   applyGeminiTransforms,
 } from "./gemini";

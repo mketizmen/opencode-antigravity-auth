@@ -25,6 +25,7 @@ export interface ModelModalities {
 
 export interface OpencodeModelDefinition extends ProviderModel {
   name: string;
+  temperature?: boolean;
   limit: ModelLimit;
   modalities: ModelModalities;
   variants?: Record<string, ModelVariant>;
@@ -94,6 +95,17 @@ export const OPENCODE_MODEL_DEFINITIONS: OpencodeModelDefinitions = {
       high: { thinkingLevel: "high" },
     },
   },
+  "antigravity-gemini-3.6-flash": {
+    name: "Gemini 3.6 Flash (Antigravity)",
+    temperature: false,
+    limit: { context: 1048576, output: 65536 },
+    modalities: DEFAULT_MODALITIES,
+    variants: {
+      low: { thinkingLevel: "low" },
+      medium: { thinkingLevel: "medium" },
+      high: { thinkingLevel: "high" },
+    },
+  },
   "antigravity-claude-sonnet-4-6": {
     name: "Claude Sonnet 4.6 (Antigravity)",
     limit: { context: 200000, output: 64000 },
@@ -127,6 +139,28 @@ export const OPENCODE_MODEL_DEFINITIONS: OpencodeModelDefinitions = {
     name: "Gemini 3.5 Flash (Gemini CLI)",
     limit: { context: 1048576, output: 65536 },
     modalities: DEFAULT_MODALITIES,
+  },
+  "gemini-3.5-flash-lite": {
+    name: "Gemini 3.5 Flash-Lite (Gemini CLI)",
+    temperature: false,
+    limit: { context: 1048576, output: 65536 },
+    modalities: DEFAULT_MODALITIES,
+    variants: {
+      minimal: { thinkingLevel: "minimal" },
+      low: { thinkingLevel: "low" },
+      medium: { thinkingLevel: "medium" },
+      high: { thinkingLevel: "high" },
+    },
+  },
+  "gemini-3.6-flash": {
+    name: "Gemini 3.6 Flash (Gemini CLI)",
+    temperature: false,
+    limit: { context: 1048576, output: 65536 },
+    modalities: DEFAULT_MODALITIES,
+    variants: {
+      medium: { thinkingLevel: "medium" },
+      high: { thinkingLevel: "high" },
+    },
   },
   "gemini-3-pro-preview": {
     name: "Gemini 3 Pro Preview (Gemini CLI)",

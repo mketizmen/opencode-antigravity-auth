@@ -243,6 +243,41 @@ describe("api-key agy sdk support", () => {
     });
   });
 
+  it.each([
+    ["antigravity-gemini-3.6-flash", "gemini-3.6-flash", "medium"],
+    ["gemini-3.5-flash-lite", "gemini-3.5-flash-lite", "minimal"],
+  ])("routes %s through the public API as %s", async (requested, actual, thinkingLevel) => {
+    const prepared = await prepareAgySdkGeminiRequest(
+      `https://generativelanguage.googleapis.com/v1beta/models/${requested}:generateContent`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          contents: [],
+          generationConfig: {
+            temperature: 0.7,
+            topP: 0.9,
+            topK: 40,
+            candidateCount: 2,
+          },
+        }),
+      },
+      { label: "env", apiKey: "test-key" },
+    );
+
+    expect(String(prepared.request)).toBe(
+      `https://generativelanguage.googleapis.com/v1beta/models/${actual}:generateContent`,
+    );
+    expect(await readPreparedBody(prepared.init.body)).toEqual({
+      contents: [],
+      generationConfig: {
+        thinkingConfig: {
+          thinkingLevel,
+          includeThoughts: true,
+        },
+      },
+    });
+  });
+
   it("preserves API-native preview model names for Gemini API requests", async () => {
     const prepared = await prepareAgySdkGeminiRequest(
       "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent",
@@ -262,6 +297,8 @@ describe("api-key agy sdk support", () => {
     // Public-API Gemini ids route to the API-key path directly.
     expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent")).toBe(true);
     expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent")).toBe(true);
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent")).toBe(true);
+    expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent")).toBe(true);
     expect(isAgySdkSupportedRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent")).toBe(true);
 
     // Antigravity-only bare Gemini ids and antigravity-prefixed variants are
@@ -311,6 +348,8 @@ describe("api-key agy sdk support", () => {
     // Public-API Gemini ids → false (they CAN be served by the public API natively).
     expect(isAntigravityOnlyGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent")).toBe(false);
     expect(isAntigravityOnlyGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent")).toBe(false);
+    expect(isAntigravityOnlyGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent")).toBe(false);
+    expect(isAntigravityOnlyGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent")).toBe(false);
     expect(isAntigravityOnlyGenerativeLanguageRequest("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent")).toBe(false);
 
     // Wrong host or malformed → false

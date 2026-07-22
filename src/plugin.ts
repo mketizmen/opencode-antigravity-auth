@@ -33,7 +33,10 @@ import {
   prepareAntigravityRequest,
   transformAntigravityResponse,
 } from "./plugin/request";
-import { resolveModelWithTier } from "./plugin/transform/model-resolver";
+import {
+  isGeminiPublicOnlyModel,
+  resolveModelWithTier,
+} from "./plugin/transform/model-resolver";
 import {
   isEmptyResponseBody,
   createSyntheticErrorResponse,
@@ -258,7 +261,7 @@ function modalitiesToCapabilities(model: ProviderModel, existing: ProviderModel 
   const output = modalities?.output ?? [];
 
   return {
-    temperature: existingCapabilities?.temperature ?? true,
+    temperature: model.temperature ?? existingCapabilities?.temperature ?? true,
     reasoning: existingCapabilities?.reasoning ?? !!model.variants,
     attachment: existingCapabilities?.attachment ?? (input.includes("image") || input.includes("pdf")),
     toolcall: existingCapabilities?.toolcall ?? true,
@@ -4263,7 +4266,10 @@ function resolveHeaderRoutingDecision(
     cliFirst,
     preferredHeaderStyle,
     explicitQuota,
-    allowQuotaFallback: family === "gemini" && resolvedModel?.isImageModel !== true,
+    allowQuotaFallback:
+      family === "gemini" &&
+      resolvedModel?.isImageModel !== true &&
+      !isGeminiPublicOnlyModel(modelWithSuffix ?? ""),
   };
 }
 

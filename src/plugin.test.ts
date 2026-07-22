@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import type { PluginClient } from "./plugin/types";
 import { AccountManager } from "./plugin/accounts";
+import { DEFAULT_CONFIG } from "./plugin/config";
 
 vi.mock("@opencode-ai/plugin", () => ({
   tool: Object.assign(
@@ -33,7 +34,7 @@ vi.mock("./plugin/storage", async (importOriginal) => {
   };
 });
 
-const { createAntigravityPlugin, loopEscapeTestHooks } = await import("./plugin");
+const { createAntigravityPlugin, loopEscapeTestHooks, __testExports } = await import("./plugin");
 const storageModule = await import("./plugin/storage");
 const { resetPublicGeminiApiModelCatalogForTests } = await import("./plugin/model-catalog");
 const { resetAgySdkCredentialStateForTests } = await import("./plugin/api-key");
@@ -49,6 +50,24 @@ const client = {
 // into another test's agy-sdk routing assertions.
 afterEach(() => {
   resetPublicGeminiApiModelCatalogForTests();
+});
+
+describe("Gemini Flash-Lite routing", () => {
+  const url =
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:streamGenerateContent";
+
+  it("uses the public Gemini quota path without Antigravity fallback", () => {
+    expect(__testExports.getHeaderStyleFromUrl(url, "gemini")).toBe(
+      "gemini-cli",
+    );
+    expect(
+      __testExports.resolveHeaderRoutingDecision(url, "gemini", DEFAULT_CONFIG),
+    ).toMatchObject({
+      preferredHeaderStyle: "gemini-cli",
+      explicitQuota: false,
+      allowQuotaFallback: false,
+    });
+  });
 });
 
 describe("createAntigravityPlugin provider models", () => {
@@ -107,6 +126,14 @@ describe("createAntigravityPlugin provider models", () => {
         id: "antigravity-gemini-3-pro",
         providerID: "google",
         api: { id: "antigravity-gemini-3-pro" },
+      });
+      expect(models?.["antigravity-gemini-3.6-flash"]?.capabilities).toMatchObject({
+        temperature: false,
+        reasoning: true,
+      });
+      expect(models?.["gemini-3.5-flash-lite"]?.capabilities).toMatchObject({
+        temperature: false,
+        reasoning: true,
       });
     } finally {
       vi.unstubAllGlobals();

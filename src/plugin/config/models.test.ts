@@ -25,6 +25,7 @@ describe("OPENCODE_MODEL_DEFINITIONS", () => {
       "antigravity-gemini-3-pro",
       "antigravity-gemini-3.1-pro",
       "antigravity-gemini-3.5-flash",
+      "antigravity-gemini-3.6-flash",
       "gemini-2.5-flash",
       "gemini-2.5-pro",
       "gemini-3-flash-preview",
@@ -32,6 +33,8 @@ describe("OPENCODE_MODEL_DEFINITIONS", () => {
       "gemini-3.1-pro",
       "gemini-3.1-pro-preview-customtools",
       "gemini-3.5-flash",
+      "gemini-3.5-flash-lite",
+      "gemini-3.6-flash",
     ]);
   });
 
@@ -54,6 +57,25 @@ describe("OPENCODE_MODEL_DEFINITIONS", () => {
     });
 
     expect(getModel("antigravity-gemini-3.5-flash").variants).toEqual({
+      minimal: { thinkingLevel: "minimal" },
+      low: { thinkingLevel: "low" },
+      medium: { thinkingLevel: "medium" },
+      high: { thinkingLevel: "high" },
+    });
+
+    expect(getModel("antigravity-gemini-3.6-flash").variants).toEqual({
+      low: { thinkingLevel: "low" },
+      medium: { thinkingLevel: "medium" },
+      high: { thinkingLevel: "high" },
+    });
+    expect(getModel("antigravity-gemini-3.6-flash").temperature).toBe(false);
+    expect(getModel("gemini-3.6-flash").temperature).toBe(false);
+    expect(getModel("gemini-3.5-flash-lite").temperature).toBe(false);
+    expect(getModel("gemini-3.6-flash").variants).toEqual({
+      medium: { thinkingLevel: "medium" },
+      high: { thinkingLevel: "high" },
+    });
+    expect(getModel("gemini-3.5-flash-lite").variants).toEqual({
       minimal: { thinkingLevel: "minimal" },
       low: { thinkingLevel: "low" },
       medium: { thinkingLevel: "medium" },
@@ -124,6 +146,10 @@ describe("dynamic model discovery helpers", () => {
         displayName: "Gemini 3 Flash",
         modelName: "gemini-3-flash",
       },
+      "gemini-3.6-flash": {
+        displayName: "Gemini 3.6 Flash",
+        modelName: "gemini-3.6-flash",
+      },
       "claude-sonnet-4-6": {
         displayName: "Claude Sonnet 4.6",
       },
@@ -131,6 +157,11 @@ describe("dynamic model discovery helpers", () => {
 
     expect(models["antigravity-gemini-3-flash"]?.variants).toEqual({
       minimal: { thinkingLevel: "minimal" },
+      low: { thinkingLevel: "low" },
+      medium: { thinkingLevel: "medium" },
+      high: { thinkingLevel: "high" },
+    });
+    expect(models["antigravity-gemini-3.6-flash"]?.variants).toEqual({
       low: { thinkingLevel: "low" },
       medium: { thinkingLevel: "medium" },
       high: { thinkingLevel: "high" },
